@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Ra System — Interactive 3D Simulation</title>
+<style>
+  :root{
+    --bg:#05070d; --panel:rgba(10,16,28,0.82); --panel2:rgba(16,24,40,0.92);
+    --line:rgba(120,170,255,0.18); --line2:rgba(120,170,255,0.35);
+    --txt:#dfe8f5; --dim:#8ea2c0; --accent:#7fb2ff; --accent2:#ffcf7a; --hot:#ff8a5a;
+    --font:'Segoe UI',Roboto,system-ui,-apple-system,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--txt);font-family:var(--font)}
+  #app{position:fixed;inset:0}
+  canvas{display:block}
+
+  /* ---------- Loading ---------- */
+  #loader{position:fixed;inset:0;background:radial-gradient(circle at 50% 40%,#0b1426,#04060c 70%);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:50;transition:opacity .8s}
+  #loader h1{font-weight:300;letter-spacing:.5em;font-size:clamp(18px,4vw,34px);
+    background:linear-gradient(90deg,#ffd9a0,#9fc0ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+  #loader p{color:var(--dim);margin-top:14px;letter-spacing:.25em;font-size:12px;text-transform:uppercase}
+  .spin{margin-top:26px;width:46px;height:46px;border:2px solid rgba(160,190,255,.18);
+    border-top-color:var(--accent2);border-radius:50%;animation:rot 1s linear infinite}
+  @keyframes rot{to{transform:rotate(360deg)}}
+
+  /* ---------- Generic panel ---------- */
+  .panel{position:absolute;background:var(--panel);backdrop-filter:blur(10px);
+    border:1px solid var(--line);border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,.5)}
+
+  /* ---------- Title ---------- */
+  #title{top:16px;left:18px;padding:12px 18px;pointer-events:none;max-width:46vw}
+  #title h1{font-weight:300;font-size:19px;letter-spacing:.12em}
+  #title h1 b{font-weight:600;color:var(--accent2)}
+  #title small{color:var(--dim);font-size:11px;letter-spacing:.15em;text-transform:uppercase}
+
+  /* ---------- Left navigator ---------- */
+  #nav{top:84px;left:18px;width:240px;max-height:calc(100vh - 200px);overflow-y:auto;padding:8px}
+  #nav h3{font-size:10px;text-transform:uppercase;letter-spacing:.22em;color:var(--dim);
+    padding:10px 10px 6px;border-bottom:1px solid var(--line);margin-bottom:4px}
+  .navitem{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:9px;cursor:pointer;
+    font-size:13px;color:var(--txt);transition:background .15s,transform .1s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .navitem:hover{background:rgba(120,170,255,.10)}
+  .navitem.active{background:rgba(127,178,255,.18);box-shadow:inset 0 0 0 1px var(--line2)}
+  .navitem .dot{width:11px;height:11px;border-radius:50%;flex:0 0 auto;box-shadow:0 0 7px currentColor}
+  .navitem.sub{padding-left:26px;font-size:12px;color:var(--dim)}
+  .navitem.sub .dot{width:8px;height:8px}
+  .navitem .tag{margin-left:auto;font-size:9px;color:#7fe6a8;opacity:.9;letter-spacing:.04em;
+    background:rgba(80,220,140,.12);border:1px solid rgba(80,220,140,.3);padding:1px 6px;border-radius:10px}
+
+  /* ---------- Bottom control bar ---------- */
+  #controls{bottom:16px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:14px;
+    padding:10px 16px;flex-wrap:wrap;justify-content:center;max-width:94vw}
+  .btn{background:rgba(127,178,255,.10);border:1px solid var(--line2);color:var(--txt);
+    padding:8px 13px;border-radius:9px;cursor:pointer;font-size:12.5px;font-family:var(--font);
+    display:inline-flex;align-items:center;gap:7px;transition:.15s;white-space:nowrap}
+  .btn:hover{background:rgba(127,178,255,.22)}
+  .btn.on{background:rgba(255,207,122,.16);border-color:rgba(255,207,122,.5);color:var(--accent2)}
+  .ctl{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--dim)}
+  .ctl label{letter-spacing:.08em;text-transform:uppercase;font-size:10px}
+  input[type=range]{-webkit-appearance:none;appearance:none;height:4px;border-radius:3px;
+    background:linear-gradient(90deg,var(--accent),var(--accent2));outline:none;cursor:pointer}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;
+    background:#fff;box-shadow:0 0 6px var(--accent2);cursor:pointer}
+  input[type=range]::-moz-range-thumb{width:15px;height:15px;border:none;border-radius:50%;background:#fff;cursor:pointer}
+  .sep{width:1px;height:26px;background:var(--line)}
+  #speedval{min-width:54px;text-align:right;color:var(--accent2);font-variant-numeric:tabular-nums}
+
+  /* ---------- Info panel ---------- */
+  #info{top:16px;right:-460px;width:430px;max-width:92vw;max-height:calc(100vh - 32px);
+    display:flex;flex-direction:column;transition:right .45s cubic-bezier(.2,.8,.2,1);background:var(--panel2)}
+  #info.open{right:16px}
+  #info .hd{position:relative;padding:18px 20px 14px;border-bottom:1px solid var(--line)}
+  #info .hd .type{display:inline-block;font-size:10px;letter-spacing:.18em;text-transform:uppercase;
+    color:#06101f;background:var(--accent2);padding:3px 9px;border-radius:20px;margin-bottom:9px;font-weight:600}
+  #info h2{font-weight:400;font-size:25px;letter-spacing:.02em}
+  #info h2 span{color:var(--dim);font-size:14px;margin-left:8px}
+  #info .tagline{color:var(--accent);font-size:13px;margin-top:6px;font-style:italic;line-height:1.4}
+  #close{position:absolute;top:14px;right:14px;width:30px;height:30px;border-radius:8px;border:1px solid var(--line);
+    background:transparent;color:var(--dim);cursor:pointer;font-size:17px;line-height:1;transition:.15s}
+  #close:hover{background:rgba(255,120,120,.16);color:#ffb0b0;border-color:rgba(255,120,120,.4)}
+  #info .body{overflow-y:auto;padding:16px 20px 22px}
+  #info .gallery{display:flex;flex-direction:column;gap:10px;margin-bottom:16px}
+  #info .gallery figure{border-radius:10px;overflow:hidden;border:1px solid var(--line);background:#000}
+  #info .gallery img{width:100%;display:block;cursor:zoom-in;transition:transform .4s}
+  #info .gallery img:hover{transform:scale(1.03)}
+  #info .gallery figcaption{font-size:11px;color:var(--dim);padding:7px 10px;line-height:1.4}
+  #info table{width:100%;border-collapse:collapse;margin-bottom:16px;font-size:12.5px}
+  #info td{padding:6px 4px;border-bottom:1px solid rgba(120,170,255,.08);vertical-align:top}
+  #info td:first-child{color:var(--dim);width:42%;letter-spacing:.02em}
+  #info td:last-child{color:var(--txt);text-align:right;font-variant-numeric:tabular-nums}
+  #info .desc p{font-size:13.5px;line-height:1.65;color:#cdd9ec;margin-bottom:11px}
+  #info .focusbtn{width:100%;margin-top:4px;justify-content:center}
+
+  /* ---------- Hover tooltip + help ---------- */
+  #tip{position:fixed;pointer-events:none;background:rgba(8,12,22,.92);border:1px solid var(--line2);
+    color:var(--txt);font-size:12px;padding:4px 9px;border-radius:7px;transform:translate(-50%,-160%);
+    opacity:0;transition:opacity .12s;white-space:nowrap;z-index:30}
+  #helpbtn{top:16px;right:16px;width:34px;height:34px;border-radius:50%}
+  #help{top:60px;right:16px;width:300px;padding:16px 18px;display:none;font-size:12.5px;line-height:1.7;z-index:25}
+  #help.open{display:block}
+  #help h4{font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--accent2);margin:12px 0 5px}
+  #help h4:first-child{margin-top:0}
+  #help b{color:var(--accent)}
+  #help .g{color:var(--dim)} #help .g b{color:var(--txt);font-weight:600}
+
+  /* ---------- Lightbox ---------- */
+  #lightbox{position:fixed;inset:0;background:rgba(2,4,9,.92);display:none;align-items:center;justify-content:center;
+    z-index:60;cursor:zoom-out;padding:30px}
+  #lightbox.open{display:flex}
+  #lightbox img{max-width:94vw;max-height:92vh;border-radius:10px;box-shadow:0 20px 80px #000}
+
+  /* ---------- Labels ---------- */
+  #labels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+  .lbl{position:absolute;transform:translate(-50%,-50%);font-size:11px;letter-spacing:.06em;color:#cfe0ff;
+    text-shadow:0 0 6px #000,0 0 3px #000;white-space:nowrap;cursor:pointer;pointer-events:auto;
+    padding:1px 4px;transition:opacity .2s}
+  .lbl::before{content:'';position:absolute;left:-9px;top:50%;width:5px;height:5px;border-radius:50%;
+    transform:translateY(-50%);background:currentColor;opacity:.7}
+  .lbl.major{font-size:12.5px;color:#eaf1ff}
+  .lbl.star{color:var(--accent2);font-size:14px}
+
+  .scrollthin::-webkit-scrollbar{width:8px}
+  .scrollthin::-webkit-scrollbar-thumb{background:rgba(120,170,255,.25);border-radius:8px}
+  .scrollthin::-webkit-scrollbar-track{background:transparent}
+
+  @media(max-width:760px){
+    #nav{display:none} #title{max-width:60vw} #info{width:92vw}
+    #help{width:80vw}
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="labels"></div>
+
+<div id="loader">
+  <h1>RA</h1>
+  <p>Building the planetary system…</p>
+  <div class="spin"></div>
+</div>
+
+<div id="title" class="panel">
+  <small>Interactive 3D Simulation · <a href="index-verbatim.html" style="pointer-events:auto;color:var(--accent);text-decoration:none">author's-text edition →</a></small>
+  <h1>The <b>Ra</b> Planetary System</h1>
+</div>
+
+<button id="helpbtn" class="btn panel" title="Help & glossary">?</button>
+<div id="help" class="panel scrollthin">
+  <h4>Navigate</h4>
+  <div class="g"><b>Drag</b> — orbit camera<br><b>Scroll</b> — zoom in / out<br><b>Right-drag</b> — pan<br><b>Click a world</b> — focus &amp; read about it<br><b>List / labels</b> — jump to any body</div>
+  <h4>About the scale</h4>
+  <div class="g"><b>Real scale</b> (default) places every orbit at its true distance in AU — so Amunet hugs the star and Horus sits far out at 46 AU; zoom out to find Shu and Horus. <b>Compressed</b> (toggle in the bottom bar) squeezes the huge 0.05–46 AU range so the whole system fits on screen at once. Body sizes are exaggerated in both modes (true sizes would be invisible). Real figures are in each world's data panel; orbital <b>speeds</b> follow Kepler's laws.</div>
+  <h4 id="gloss-h">Glossary</h4>
+  <div class="g" id="gloss"></div>
+</div>
+
+<div id="nav" class="panel scrollthin"></div>
+
+<div id="controls" class="panel">
+  <button id="play" class="btn">⏸ Pause</button>
+  <div class="ctl"><label>Speed</label>
+    <input id="speed" type="range" min="0" max="100" value="22" style="width:120px">
+    <span id="speedval">1.0×</span>
+  </div>
+  <div class="sep"></div>
+  <div class="ctl"><label>Size</label>
+    <input id="size" type="range" min="40" max="260" value="100" style="width:90px">
+  </div>
+  <div class="sep"></div>
+  <button id="t-scale" class="btn on" title="Toggle real-distance vs compressed orbits">📏 Real scale</button>
+  <button id="t-text" class="btn" title="Switch between the author's own text and a short summary">📖 Summary text</button>
+  <button id="t-orbits" class="btn on">◉ Orbits</button>
+  <button id="t-labels" class="btn on">🏷 Labels</button>
+  <button id="reset" class="btn">⟲ Reset view</button>
+</div>
+
+<div id="info" class="panel">
+  <div class="hd">
+    <button id="close">×</button>
+    <span class="type" id="i-type"></span>
+    <h2 id="i-name"></h2>
+    <div class="tagline" id="i-tag"></div>
+  </div>
+  <div class="body scrollthin">
+    <div class="gallery" id="i-gallery"></div>
+    <table id="i-stats"></table>
+    <div class="desc" id="i-desc"></div>
+  </div>
+</div>
+
+<div id="tip"></div>
+<div id="lightbox"><img id="lightbox-img" alt=""></div>
+
+<script src="assets/lib/three.min.js"></script>
+<script src="assets/lib/OrbitControls.js"></script>
+<script src="assets/data.js"></script>
+<script src="assets/descriptions-verbatim.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
