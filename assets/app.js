@@ -25,6 +25,9 @@ const AU_UNIT = 110;                      // real: scene units per AU (linear)
 const SIZE_K = 0.0586, SIZE_P = 0.40;     // body radius = SIZE_K * km^0.40 (shared base)
 const STAR_R_COMPRESS = 7.6, STAR_R_REAL = 1.9;
 const YEARS_PER_SEC = 0.030;              // sim years per real second at 1.0× (calm baseline)
+// Speed slider (0..100) maps logarithmically to 0.01×..40×. Default ≈ 0.02×:
+const DEFAULT_SPEED_V = 100*Math.log(0.02/0.01)/Math.log(40/0.01);   // ≈ 8.357
+const DEFAULT_SIZE_V  = 100;             // Size slider value for the default body size (sizeMult = 1.0)
 
 let realScale = true;                     // default to REAL scale (per request)
 
@@ -659,7 +662,8 @@ function setupInteraction(){
   lb.onclick=()=>lb.classList.remove('open');
   APP.openLightbox=(src)=>{ lbi.src=src; lb.classList.add('open'); };
 
-  setSpeed(22);
+  document.getElementById('speed').value = DEFAULT_SPEED_V;
+  setSpeed(DEFAULT_SPEED_V);
 }
 
 function pick(e){
@@ -691,7 +695,11 @@ function setSize(v){
 }
 function resetView(){
   selected=null; closeInfo(); setActiveNav(null);
+  // restore the Size slider to its default (real/baseline) size
+  const sz=document.getElementById('size');
+  if(sz){ sz.value=DEFAULT_SIZE_V; setSize(DEFAULT_SIZE_V); }
   frameSystem();
+  controls.update();   // apply the reset immediately (damping is on)
 }
 
 /* focus camera on a body */

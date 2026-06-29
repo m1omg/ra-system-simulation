@@ -10,18 +10,17 @@ brown-dwarf companion **Horus** with its own four worlds.
 Firefox, Edge). No server, no internet, no installation required. Everything runs
 locally.
 
-### Two editions
+### Two reading modes (one page, **📖** toggle)
 
-- **`index.html`** — the **default** edition: each world opens with a short, readable
-  summary, followed by your *exact* words from the source document underneath (where the
-  document describes that world).
-- **`index-verbatim.html`** — the **author's-text** edition: descriptions are your
-  *exact* words only, with no summary and no paraphrasing.
+Each world opens with a short, readable **summary**, followed by your *exact* words from the
+source document underneath (where the document describes that world). The **📖** button in the
+bottom bar flips between:
 
-Either way you can flip between the two with the **📖** button in the bottom bar, and
-the two pages link to each other from the top-left title. (Worlds the document hasn't
-described yet — Shu, Horus, Khonsu, Nut, Osiris — show only the summary in the default
-edition, and a short note in author's-text mode.)
+- **Summary + source** (default) — the summary, then your verbatim text beneath it.
+- **Author's text** — your *exact* words only, with no summary and no paraphrasing.
+
+(Worlds the document hasn't described yet — Shu, Horus, Khonsu, Nut, Osiris — show only the
+summary in the default mode, and a short note in author's-text mode.)
 
 ## What's inside
 
@@ -70,8 +69,7 @@ physically correct (Kepler's third law).
 ## Files
 
 ```
-index.html                       — summary edition (page shell + UI)
-index-verbatim.html              — author's-text edition (same app, verbatim default)
+index.html                       — the page (shell + UI; 📖 toggles summary/author's text)
 assets/app.js                    — 3D engine (Three.js scene, textures, orbits, interaction)
 assets/data.js                   — body data, stats, summary descriptions
 assets/descriptions-verbatim.js  — the author's word-for-word descriptions
