@@ -259,15 +259,11 @@ function makeAtmosphere(radius, color, strength){
   const mat=new THREE.ShaderMaterial({
     uniforms:{ c:{value:new THREE.Color(color)}, p:{value:strength} },
     vertexShader:`varying vec3 vN; varying vec3 vV;
-      #include <logdepthbuf_pars_vertex>
       void main(){ vN=normalize(normalMatrix*normal);
         vec4 mv=modelViewMatrix*vec4(position,1.0); vV=normalize(-mv.xyz);
-        gl_Position=projectionMatrix*mv;
-        #include <logdepthbuf_vertex> }`,
+        gl_Position=projectionMatrix*mv; }`,
     fragmentShader:`uniform vec3 c; uniform float p; varying vec3 vN; varying vec3 vV;
-      #include <logdepthbuf_pars_fragment>
-      void main(){ #include <logdepthbuf_fragment>
-        float i=pow(1.0-abs(dot(vN,vV)),2.6); gl_FragColor=vec4(c, i*p); }`,
+      void main(){ float i=pow(1.0-abs(dot(vN,vV)),2.6); gl_FragColor=vec4(c, i*p); }`,
     side:THREE.BackSide, blending:THREE.AdditiveBlending, transparent:true, depthWrite:false
   });
   const m=new THREE.Mesh(new THREE.SphereGeometry(radius,48,48), mat);
@@ -418,12 +414,12 @@ function build(){
   scene=new THREE.Scene();
   scene.background=new THREE.Color(0x04060c);
 
-  // tiny near plane + logarithmic depth buffer so you can fly right up to a true-scale world
-  // (spanning ~2,500 km moons to 46 AU orbits) without clipping or z-fighting.
-  camera=new THREE.PerspectiveCamera(48, innerWidth/innerHeight, 0.0005, 400000);
+  // near/far are adapted to zoom each frame (see animate) so you can fly right up to a
+  // true-scale world (~2,500 km moons out to 46 AU orbits) without clipping.
+  camera=new THREE.PerspectiveCamera(48, innerWidth/innerHeight, 0.01, 30000);
   camera.position.set(0, 95, 235);
 
-  renderer=new THREE.WebGLRenderer({antialias:true, canvas:undefined, logarithmicDepthBuffer:true});
+  renderer=new THREE.WebGLRenderer({antialias:true, canvas:undefined});
   renderer.setSize(innerWidth,innerHeight);
   renderer.setPixelRatio(Math.min(devicePixelRatio,2));
   // AI textures are brighter than the procedural ones — roll off highlights so icy worlds
@@ -618,6 +614,10 @@ function animate(){
 
   controls.update();
   if(realScale) updateBodySizes();        // true size, floored to a visible dot
+  // adapt the depth range to zoom so close fly-ins to true-scale worlds stay precise
+  const camDist=camera.position.distanceTo(controls.target);
+  const near=Math.max(camDist*0.002, 0.0002), far=camDist+30000;
+  if(camera.near!==near || camera.far!==far){ camera.near=near; camera.far=far; camera.updateProjectionMatrix(); }
   renderer.render(scene,camera);
   if(showLabels) updateLabels();
 }
