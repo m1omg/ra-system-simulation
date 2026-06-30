@@ -497,14 +497,19 @@ function addMoon(m, parentRec){
   const sysMoons = (parentRec.data.key==='horus')?HORUS_MOONS:MOONS.filter(x=>x.parent===parentRec.data.key);
   const refDist = Math.min.apply(null, sysMoons.map(x=>x.dist));
   const spacing = Math.max(2.2, parentRec.radius*0.95);
-  const aDisp = parentRec.radius*1.7 + spacing*Math.pow(m.dist/refDist, 0.5);
+  // compressed: tuned for visibility; real: the moon's TRUE distance from its parent
+  // (moon dist is in AU) so apparent sizes within a subsystem are physically correct.
+  const aDispCompressed = parentRec.radius*1.7 + spacing*Math.pow(m.dist/refDist, 0.5);
+  const aDispReal = m.dist * AU_UNIT;
   const idx = sysMoons.indexOf(sysMoons.find(x=>x.key===m.key));
-  return addBody(m, parentRec.holder, {
-    aDisp,
+  const rec = addBody(m, parentRec.holder, {
+    aDisp: realScale?aDispReal:aDispCompressed,
     incl: 1.5 + idx*4 + (m.parent==='horus'?2:0),
     node: nodeFor(m.key),
     orbitOpacity: 0.22
   });
+  rec.isMoon = true; rec.aDispReal = aDispReal; rec.aDispCompressed = aDispCompressed;
+  return rec;
 }
 
 /* ---- scale mode (compressed <-> real distances) ---- */
@@ -514,7 +519,10 @@ function applySizes(){
 }
 function applyScaleMode(){
   starGroup.scale.setScalar(starVisR()/STAR_R_COMPRESS);
-  for(const rec of bodies){ if(rec.helio){ rec.aDisp=distDisp(rec.data.dist); rebuildOrbitLine(rec); } }
+  for(const rec of bodies){
+    if(rec.helio){ rec.aDisp=distDisp(rec.data.dist); rebuildOrbitLine(rec); }
+    else if(rec.isMoon){ rec.aDisp = realScale?rec.aDispReal:rec.aDispCompressed; rebuildOrbitLine(rec); }
+  }
   applySizes();
   controls.maxDistance = realScale?20000:4000;
   controls.minDistance = realScale?0.004:0.8;
