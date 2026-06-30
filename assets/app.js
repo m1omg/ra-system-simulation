@@ -287,6 +287,23 @@ function buildBodyMesh(data, radius){
     if(emap){ mat.emissiveMap=new THREE.CanvasTexture(emap); mat.emissive=new THREE.Color(0xffffff);
       mat.emissiveIntensity=data.emissiveScale||0.5; }
   }
+  // Experimental: opt-in AI textures (index-ai.html sets window.USE_AI_TEXTURES).
+  // The procedural map above shows instantly; if a baked image exists we swap it in,
+  // and on any miss/error we silently keep the procedural texture.
+  if(typeof window!=='undefined' && window.USE_AI_TEXTURES){
+    new THREE.TextureLoader().load(
+      'assets/img/textures/'+data.key+'.jpg',
+      function(t){
+        t.anisotropy=4; t.wrapS=map.wrapS; t.wrapT=map.wrapT;
+        if(map.encoding!==undefined) t.encoding=map.encoding;
+        mat.map=t; mat.needsUpdate=true;
+        // the AI lava map already reads hot — ease the procedural emissive glow
+        if(data.kind==='lava' && mat.emissiveIntensity!==undefined) mat.emissiveIntensity*=0.55;
+      },
+      undefined,
+      function(){ /* missing / failed → keep the procedural texture */ }
+    );
+  }
   const mesh=new THREE.Mesh(geo, mat);
   mesh.userData.bodyKey=data.key;
   return mesh;

@@ -80,5 +80,28 @@ assets/lib/                      — Three.js r132 + OrbitControls (bundled for 
 To update a world's numbers or summary text, edit `assets/data.js`; to update the
 verbatim text, edit `assets/descriptions-verbatim.js`.
 
+## Experimental: AI-generated textures (`index-ai.html`)
+
+`index.html` always uses the fast, offline, deterministic **procedural** textures. The
+separate **`index-ai.html`** is an experiment that swaps in higher-res, photoreal surface
+maps generated with OpenAI **gpt-image-2**, while keeping everything else identical. If a
+world has no AI texture yet (or the file fails to load) it silently falls back to its
+procedural texture, so the page always works.
+
+The textures are **baked once, offline** and committed as plain image files — the page
+itself makes no API calls, so it stays openable offline with no key. To (re)generate:
+
+```
+node tools/gen-refs.mjs          # 1. render procedural refs + build per-body prompts
+                                 #    -> tools/_raw/ref/<key>.png, tools/prompts.json
+# 2. generate the raw AI renders (via Codex / gpt-image-2) into tools/_raw/ai/<key>.png
+python3 tools/post.py            # 3. seam-blend + downscale -> assets/img/textures/<key>.jpg
+```
+
+`tools/texture-core.mjs` is a headless duplicate of the procedural generators from
+`assets/app.js` (kept in sync by hand) used only to produce the reference images.
+`tools/_raw/` (references + full-res originals) is git-ignored; only the final
+`assets/img/textures/*.jpg` are committed.
+
 ---
 *Planetary classification follows the ArcBuilder PCL. Built from “Satis v10”.*

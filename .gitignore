@@ -13,3 +13,9 @@ desktop.ini
 
 # Local Claude Code config
 .claude/
+
+# AI-texture tooling: regenerable references / full-res originals, secrets, deps
+tools/_raw/
+tools/node_modules/
+.env
+*.env
