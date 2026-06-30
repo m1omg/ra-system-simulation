@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>The Ra System — Interactive 3D Simulation</title>
 <style>
   :root{
@@ -69,9 +69,12 @@
   #speedval{min-width:54px;text-align:right;color:var(--accent2);font-variant-numeric:tabular-nums}
 
   /* ---------- Info panel ---------- */
-  #info{top:16px;right:-460px;width:430px;max-width:92vw;max-height:calc(100vh - 32px);
-    display:flex;flex-direction:column;transition:right .45s cubic-bezier(.2,.8,.2,1);background:var(--panel2)}
-  #info.open{right:16px}
+  /* slide via transform (not a negative `right`, which would push the page
+     wider on mobile and shove the open panel off-screen) */
+  #info{top:16px;right:16px;width:430px;max-width:92vw;max-height:calc(100vh - 32px);
+    display:flex;flex-direction:column;transform:translateX(calc(100% + 24px));
+    transition:transform .45s cubic-bezier(.2,.8,.2,1);background:var(--panel2)}
+  #info.open{transform:translateX(0)}
   #info .hd{position:relative;padding:18px 20px 14px;border-bottom:1px solid var(--line)}
   #info .hd .type{display:inline-block;font-size:10px;letter-spacing:.18em;text-transform:uppercase;
     color:#06101f;background:var(--accent2);padding:3px 9px;border-radius:20px;margin-bottom:9px;font-weight:600}
@@ -129,9 +132,28 @@
   .scrollthin::-webkit-scrollbar-thumb{background:rgba(120,170,255,.25);border-radius:8px}
   .scrollthin::-webkit-scrollbar-track{background:transparent}
 
-  @media(max-width:760px){
-    #nav{display:none} #title{max-width:60vw} #info{width:92vw}
-    #help{width:80vw}
+  /* ---------- Tablet / phone (portrait & small landscape) ---------- */
+  @media(max-width:900px){
+    #nav{display:none}
+    #title{max-width:70vw}
+    #help{width:min(320px,86vw)}
+    #controls{bottom:calc(12px + env(safe-area-inset-bottom,0px));gap:10px;padding:9px 12px}
+
+    /* Info panel becomes a bottom sheet — full width, slides up, never
+       overflows the screen edge regardless of the device's viewport quirks */
+    #info{
+      top:auto;bottom:0;left:0;right:0;
+      width:100%;max-width:100%;
+      max-height:80vh;
+      border-radius:16px 16px 0 0;
+      transform:translateY(100%);
+      transition:transform .4s cubic-bezier(.2,.8,.2,1);
+    }
+    #info.open{transform:translateY(0)}
+    #info .hd{padding-top:24px}
+    #info .hd::before{content:"";position:absolute;top:10px;left:50%;transform:translateX(-50%);
+      width:40px;height:4px;border-radius:3px;background:var(--line2)}      /* grab handle */
+    #info .body{padding-bottom:calc(22px + env(safe-area-inset-bottom,0px))}
   }
 </style>
 </head>
