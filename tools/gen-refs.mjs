@@ -98,6 +98,14 @@ const PROMPT_OVERRIDE = {
     "Scattered SPARSELY across the dark ocean, and faintly frosting the inner edges of the ice caps, are delicate blooms of BIOLUMINESCENT VIOLET / PURPLE phytoplankton — soft glowing magenta-violet wisps and swirls. Keep them SUBTLE and uncommon: the great majority of the map is deep blue ocean; the purple is a faint luminous accent, not dominant, not covering everything.",
     "Dominant colours (hex): #0e3a72 and #2f73bd for the deep ocean, #dfeefa for the ice caps, with sparse #8a3fb0 / #b86fd0 bioluminescent purple.",
     "Photoreal, crisp, high-resolution. No land anywhere — water and ice only."
+  ].join('\n'),
+  anubis: [
+    ...HEADER,
+    "Subject: Anubis — an ABIOTIC, utterly lifeless 'blue marble' moon: deep blue liquid-water OCEANS with some BARREN land and pale polar ice caps.",
+    "Critically, the land is DEAD ROCK ONLY — grey, tan and ochre barren desert and weathered stone, sterile and lifeless. ABSOLUTELY NO vegetation, NO green, NO forests, NO plant life or algae of any kind. This world has free oxygen but ZERO life, so nothing is green.",
+    "Deep blue oceans, barren grey-tan rocky continents and islands, bright pale polar ice caps, thin wispy white clouds.",
+    "Dominant colours (hex): #2a5a7a and #4f86ad ocean; #c8c0b0 and grey-tan barren rock; #dfeaf0 ice and cloud. Absolutely no greens.",
+    "Photoreal, crisp, high-resolution."
   ].join('\n')
 };
 
