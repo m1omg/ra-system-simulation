@@ -80,10 +80,10 @@ assets/lib/                      — Three.js r132 + OrbitControls (bundled for 
 To update a world's numbers or summary text, edit `assets/data.js`; to update the
 verbatim text, edit `assets/descriptions-verbatim.js`.
 
-## Experimental: AI-generated textures (`index-ai.html`)
+## AI-generated textures (`index-ai.html`)
 
 `index.html` always uses the fast, offline, deterministic **procedural** textures. The
-separate **`index-ai.html`** is an experiment that swaps in higher-res, photoreal surface
+separate **`index-ai.html`** swaps in higher-res, photoreal surface
 maps generated with OpenAI **gpt-image-2**, while keeping everything else identical. If a
 world has no AI texture yet (or the file fails to load) it silently falls back to its
 procedural texture, so the page always works.
