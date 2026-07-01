@@ -26,9 +26,10 @@ summary in the default mode, and a short note in author's-text mode.)
 
 - **Every body from the document**, placed on Keplerian elliptical orbits with
   physically-scaled *relative* orbital speeds (inner worlds race, outer worlds crawl).
-- **Procedurally textured worlds** generated in the browser: banded gas giants, the
-  blue-marble ocean of Uat-Ur, Satis's violet-forested continents, the rusty deserts
-  of Set, molten Sekhmet, the brown-dwarf glow of Horus, and more.
+- **Photoreal surface maps** for every world (with a procedural texture baked into the
+  browser as an instant fallback): banded gas giants, the blue-marble ocean of Uat-Ur,
+  Satis's violet-forested continents, the rusty deserts of Set, molten Sekhmet, the
+  brown-dwarf glow of Horus, and more.
 - **Click any world** (or use the list on the left, or click its label) to fly the
   camera to it and open a data panel with its real figures, a description, and the
   AI-rendered concept art from the document.
@@ -80,15 +81,14 @@ assets/lib/                      — Three.js r132 + OrbitControls (bundled for 
 To update a world's numbers or summary text, edit `assets/data.js`; to update the
 verbatim text, edit `assets/descriptions-verbatim.js`.
 
-## AI-generated textures (`index-ai.html`)
+## Surface textures
 
-`index.html` always uses the fast, offline, deterministic **procedural** textures. The
-separate **`index-ai.html`** swaps in higher-res, photoreal surface
-maps generated with OpenAI **gpt-image-2**, while keeping everything else identical. If a
-world has no AI texture yet (or the file fails to load) it silently falls back to its
-procedural texture, so the page always works.
+Every world loads a **baked, photoreal surface map** (`assets/img/textures/<key>.jpg`)
+by default. Each one has a fast, deterministic **procedural** texture generated in the
+browser as an instant first paint and automatic fallback: if a baked map is missing or
+fails to load, the world silently keeps its procedural texture, so the page always works.
 
-The textures are **baked once, offline** and committed as plain image files — the page
+The maps are **baked once, offline** and committed as plain image files — the page
 itself makes no API calls, so it stays openable offline with no key. To (re)generate:
 
 ```

@@ -301,7 +301,7 @@ function buildBodyMesh(data, radius){
     if(emap){ mat.emissiveMap=new THREE.CanvasTexture(emap); mat.emissive=new THREE.Color(0xffffff);
       mat.emissiveIntensity=data.emissiveScale||0.5; }
   }
-  // Experimental: opt-in AI textures (index-ai.html sets window.USE_AI_TEXTURES).
+  // Baked surface textures (index.html sets window.USE_AI_TEXTURES; on by default).
   // The procedural map above shows instantly; if a baked image exists we swap it in,
   // and on any miss/error we silently keep the procedural texture.
   if(typeof window!=='undefined' && window.USE_AI_TEXTURES){
