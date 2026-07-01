@@ -66,6 +66,7 @@ const PLANETS = [
     palette: ["#7a4a2a","#caa06a","#e6c08a","#b87a3c","#e8e0d0","#d98a4a"],
     emissive: 0x3a1402, emissiveScale: 0.35,
     atmo: 0xe0a868,
+    evapTail: true,       // it sheds vaporised envelope — drawn as a comet-like gas tail
     stats: [
       ["Type", "Hot super-Neptune (composition) / hot Saturn (mass)"],
       ["Mass", "98.8 M⊕ (0.311 Jupiter)"],
@@ -307,6 +308,7 @@ const MOONS = [
     rocky: { base:"#7a3a10", a:"#e6a83a", b:"#2a1206", c:"#ffd060" },
     emissive: 0x401400, emissiveScale: 0.5,
     tail: 0xffb060,
+    evapTail: { alpha: 0.4, rate: 0.55 },   // "subtle comet-like tail" — much milder than Amunet's
     stats: [
       ["Mass", "0.761 × Luna"],
       ["Density", "6.23 g/cm³"],

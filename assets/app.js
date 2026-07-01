@@ -246,7 +246,7 @@ function texGlow(inner, outer){
    ============================================================ */
 const APP = {};
 let scene,camera,renderer,controls,clock;
-let playing=true, timeScale=1.0, sizeMult=1.0, showOrbits=true, showLabels=true;
+let playing=true, timeScale=1.0, sizeMult=1.0, showOrbits=true, showLabels=true, showTails=true;
 let elapsedYears=0, _clockT=0;    // accumulated sim-time + throttle timer for the clock readout
 let USE_VERBATIM = !!window.USE_VERBATIM;   // true = show only the author's own text
 const bodies=[];           // every animated body
@@ -472,6 +472,9 @@ function build(){
   horusRec.mesh.add(hLight);
   for(const m of HORUS_MOONS){ addMoon(m, horusRec); }
 
+  // evaporation tails (bodies flagged evapTail in data.js — planets and moons)
+  for(const rec of bodies) if(rec.data.evapTail) makeEvapTail(rec);
+
   buildNav(); buildGlossary();
   window.addEventListener('resize', onResize);
   setupInteraction();
@@ -584,6 +587,159 @@ function buildStarfield(){
 }
 
 /* ============================================================
+   Evaporation tail — a hot world shedding its envelope
+   (bodies flagged evapTail in data.js, e.g. Amunet).
+   A fixed ring buffer of additive point sprites, emitted along the
+   orbit arc swept each frame and blown anti-starward. Runs on sim
+   time, so pausing freezes it and extreme speeds smear it into the
+   gas torus such planets really leave along their orbit.
+   ============================================================ */
+const evapTails=[];
+const EVAP_N=3072;            // particles per tail (ring buffer, one draw call)
+const EVAP_LIFE_ORB=0.16;     // particle lifetime as a fraction of the orbital period
+const EVAP_LEN_FRAC=0.45;     // real mode: tail length as a fraction of the orbit radius
+const EVAP_LEN_RADII=2.6;     // compressed mode: tail length in (exaggerated) planet radii
+const EVAP_MAX_EMIT=256;      // per-frame emission cap (extreme time speeds recycle instead)
+const _evP=new THREE.Vector3(), _evD=new THREE.Vector3(), _evR=new THREE.Vector3();
+
+function makeEvapTail(rec){
+  // per-body config: evapTail:true = Amunet-strength defaults; or {alpha,rate,len} to soften.
+  // data.tail (hex) tints the plume — e.g. Sekhmet's sulfur-orange.
+  const cfg=(typeof rec.data.evapTail==='object')?rec.data.evapTail:{};
+  const tint=rec.data.tail!=null?new THREE.Color(rec.data.tail):null;
+  const colA=tint?tint.clone().lerp(new THREE.Color(1,1,1),0.65):new THREE.Color(1.0,0.93,0.76);
+  const colB=tint?tint.clone():new THREE.Color(0.95,0.62,0.30);
+  const colC=tint?tint.clone().multiplyScalar(0.35):new THREE.Color(0.42,0.22,0.38);
+  const pos=new Float32Array(EVAP_N*3);
+  const age01=new Float32Array(EVAP_N).fill(1);          // 1 = dead/invisible
+  const size=new Float32Array(EVAP_N);
+  const seed=new Float32Array(EVAP_N);
+  for(let i=0;i<EVAP_N;i++) seed[i]=Math.random();
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos,3).setUsage(THREE.DynamicDrawUsage));
+  g.setAttribute('aAge',     new THREE.BufferAttribute(age01,1).setUsage(THREE.DynamicDrawUsage));
+  g.setAttribute('aSize',    new THREE.BufferAttribute(size,1).setUsage(THREE.DynamicDrawUsage));
+  g.setAttribute('aSeed',    new THREE.BufferAttribute(seed,1));
+  const m=new THREE.ShaderMaterial({
+    uniforms:{ uScaleH:{value:600}, uMaxPx:{value:110}, uAlpha:{value:cfg.alpha||1},
+               uColA:{value:colA}, uColB:{value:colB}, uColC:{value:colC} },
+    vertexShader:
+      'attribute float aAge; attribute float aSize; attribute float aSeed;\n'+
+      'varying float vAge; varying float vSeed;\n'+
+      'uniform float uScaleH; uniform float uMaxPx;\n'+
+      'void main(){\n'+
+      '  vAge=aAge; vSeed=aSeed;\n'+
+      '  vec4 mv=modelViewMatrix*vec4(position,1.0);\n'+
+      '  float grow=1.0+4.8*aAge;\n'+                       // gas puffs expand as they age
+      '  gl_PointSize=clamp(aSize*grow*uScaleH/max(0.0001,-mv.z), 1.0, uMaxPx);\n'+
+      '  gl_Position=projectionMatrix*mv;\n'+
+      '}',
+    fragmentShader:
+      'varying float vAge; varying float vSeed;\n'+
+      'uniform float uAlpha; uniform vec3 uColA; uniform vec3 uColB; uniform vec3 uColC;\n'+
+      'void main(){\n'+
+      '  if(vAge>=1.0) discard;\n'+
+      '  float r=length(gl_PointCoord-0.5)*2.0;\n'+
+      '  float disc=exp(-4.5*r*r);\n'+                      // gaussian puff — no readable edges
+      '  float fade=smoothstep(0.0,0.06,vAge)*(1.0-smoothstep(0.45,1.0,vAge));\n'+
+      // hot escaping gas: bright head colour -> body -> dim wisps (default white-gold/bronze/violet)
+      '  vec3 col = vAge<0.35 ? mix(uColA,uColB,vAge/0.35)\n'+
+      '                       : mix(uColB,uColC,(vAge-0.35)/0.65);\n'+
+      '  float a=disc*fade*(0.030+0.025*vSeed)*(1.0+2.2*(1.0-vAge))*uAlpha;\n'+  // dense bright head -> wispy end
+      '  gl_FragColor=vec4(col,a);\n'+                      // additive: adds col*a
+      '}',
+    transparent:true, depthWrite:false, depthTest:true, blending:THREE.AdditiveBlending });
+  const points=new THREE.Points(g,m);
+  points.frustumCulled=false;      // particles outgrow the geometry's bounding sphere
+  scene.add(points);
+  const t={rec, points, g, pos, age01, size,
+    velYr:new Float32Array(EVAP_N*3),          // scene units per sim-year
+    ageYr:new Float32Array(EVAP_N).fill(1), lifeYr:new Float32Array(EVAP_N).fill(1),
+    head:0, emitAcc:0, prevM:rec.M, lastADisp:rec.aDisp,
+    rate:cfg.rate||1, len:cfg.len||1};
+  evapTails.push(t);
+  return t;
+}
+
+function toggleTails(){
+  showTails=!showTails;
+  for(const t of evapTails){
+    t.points.visible=showTails;
+    if(showTails){                    // regrow cleanly instead of showing stale puffs
+      t.ageYr.fill(1); t.lifeYr.fill(1); t.age01.fill(1);
+      t.g.attributes.aAge.needsUpdate=true; t.prevM=t.rec.M; t.emitAcc=0;
+    }
+  }
+  const b=document.getElementById('t-tails');
+  if(b) b.classList.toggle('on', showTails);
+}
+
+function updateEvapTails(simDt){   // simDt = sim-years advanced this frame (0 while paused)
+  if(!showTails) return;
+  for(const t of evapTails){
+    const rec=t.rec;
+    if(rec.aDisp!==t.lastADisp){   // scale mode flipped — old positions are meaningless
+      t.ageYr.fill(1); t.lifeYr.fill(1); t.age01.fill(1);
+      t.lastADisp=rec.aDisp; t.prevM=rec.M; t.emitAcc=0;
+      t.g.attributes.aAge.needsUpdate=true;
+      if(simDt<=0) continue;
+    }
+    if(simDt>0){
+      const life=EVAP_LIFE_ORB*rec.period;
+      const dispR=rec.radius*rec.mesh.scale.x;             // current on-screen radius
+      // moons: tail spans ~1.5× their orbit so it sweeps across the parent (per the source doc)
+      const tailLen=(realScale ? (rec.helio?EVAP_LEN_FRAC:1.5)*rec.aDisp
+                               : EVAP_LEN_RADII*dispR)*t.len;
+      const speed=tailLen/life;
+      const bp=rec.parentHolder.position;                  // world offset: (0,0,0) for planets
+      // advect living particles
+      for(let i=0;i<EVAP_N;i++){
+        if(t.ageYr[i]>=t.lifeYr[i]) continue;
+        t.ageYr[i]+=simDt;
+        t.pos[i*3]  +=t.velYr[i*3]  *simDt;
+        t.pos[i*3+1]+=t.velYr[i*3+1]*simDt;
+        t.pos[i*3+2]+=t.velYr[i*3+2]*simDt;
+      }
+      // emit along the orbit arc swept this frame (fractional accumulator keeps the
+      // steady-state population matched to the lifetime at any time rate)
+      t.emitAcc+=simDt/life*EVAP_N*t.rate;
+      let n=Math.floor(t.emitAcc); t.emitAcc-=n;
+      if(n>EVAP_MAX_EMIT){ n=EVAP_MAX_EMIT; t.emitAcc=0; }
+      const dM=rec.M-t.prevM;
+      for(let k=0;k<n;k++){
+        const i=t.head; t.head=(t.head+1)%EVAP_N;
+        const f=(k+1)/n;
+        // planet position at this sub-step (same Kepler math as positionBody)
+        const M=(t.prevM+dM*f)%(Math.PI*2);
+        const E=kepler(M,rec.e), a=rec.aDisp, b=a*Math.sqrt(1-rec.e*rec.e);
+        _evP.set(a*(Math.cos(E)-rec.e),0,b*Math.sin(E)).applyQuaternion(rec.q).add(bp);
+        _evD.copy(_evP).normalize();                       // anti-starward (star at origin)
+        _evR.set(Math.random()*2-1,Math.random()*2-1,Math.random()*2-1).normalize();
+        _evR.addScaledVector(_evD,0.9).normalize();        // spawn biased to the night-side limb
+        const j=i*3, spd=speed*(0.75+0.5*Math.random());
+        t.pos[j]=_evP.x+_evR.x*dispR; t.pos[j+1]=_evP.y+_evR.y*dispR; t.pos[j+2]=_evP.z+_evR.z*dispR;
+        _evD.x+=_evR.x*0.16; _evD.y+=_evR.y*0.16; _evD.z+=_evR.z*0.16; _evD.normalize();
+        t.velYr[j]=_evD.x*spd; t.velYr[j+1]=_evD.y*spd; t.velYr[j+2]=_evD.z*spd;
+        t.lifeYr[i]=life*(0.7+0.6*Math.random());
+        const back=simDt*(1-f);                            // back-date along the sweep
+        t.ageYr[i]=back;
+        t.pos[j]+=t.velYr[j]*back; t.pos[j+1]+=t.velYr[j+1]*back; t.pos[j+2]+=t.velYr[j+2]*back;
+        t.size[i]=tailLen*0.0125*(0.9+0.8*Math.random());  // ∝ tail length (matches Amunet's tuned look)
+      }
+      t.prevM=rec.M;
+      for(let i=0;i<EVAP_N;i++) t.age01[i]=Math.min(1, t.ageYr[i]/t.lifeYr[i]);
+      t.g.attributes.position.needsUpdate=true;
+      t.g.attributes.aAge.needsUpdate=true;
+      t.g.attributes.aSize.needsUpdate=true;
+    }
+    // perspective point sizing (device px; canvas height already includes pixelRatio)
+    t.points.material.uniforms.uScaleH.value =
+      renderer.domElement.height/(2*Math.tan(camera.fov*Math.PI/360));
+    t.points.material.uniforms.uMaxPx.value = realScale ? 110 : 36;  // compressed = overview map
+  }
+}
+
+/* ============================================================
    Animation
    ============================================================ */
 let follow=null;            // body rec being followed
@@ -601,6 +757,7 @@ function animate(){
     elapsedYears += YEARS_PER_SEC*timeScale*dt;          // real sim-time elapsed
     _clockT += dt; if(_clockT>=0.25){ _clockT=0; updateClock(); }
   }
+  updateEvapTails(playing ? YEARS_PER_SEC*timeScale*dt : 0);
 
   // focus tween
   if(tween.active){
@@ -720,6 +877,7 @@ function setupInteraction(){
   if(tt){ tt.onclick=function(){ USE_VERBATIM=!USE_VERBATIM; updateTextUI();
     if(APP.currentData && document.getElementById('info').classList.contains('open')) openInfo(APP.currentData); }; }
   updateTextUI();
+  const tls=document.getElementById('t-tails'); if(tls) tls.onclick=toggleTails;
   document.getElementById('t-orbits').onclick=function(){ showOrbits=!showOrbits; this.classList.toggle('on',showOrbits);
     for(const b of bodies) if(b.orbitLine) b.orbitLine.visible=showOrbits; };
   document.getElementById('t-labels').onclick=function(){ showLabels=!showLabels; this.classList.toggle('on',showLabels);
