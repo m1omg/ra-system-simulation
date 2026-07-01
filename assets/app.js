@@ -712,6 +712,9 @@ function setupInteraction(){
   document.getElementById('play').onclick=togglePlay;
   document.getElementById('speed').oninput=e=>setSpeed(+e.target.value);
   document.getElementById('size').oninput=e=>setSize(+e.target.value);
+  const szres=document.getElementById('size-reset');
+  if(szres) szres.onclick=()=>{ const s=document.getElementById('size');
+    if(s) s.value=DEFAULT_SIZE_V; setSize(DEFAULT_SIZE_V); };
   document.getElementById('t-scale').onclick=function(){ setScaleMode(!realScale); };
   const tt=document.getElementById('t-text');
   if(tt){ tt.onclick=function(){ USE_VERBATIM=!USE_VERBATIM; updateTextUI();
