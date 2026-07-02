@@ -253,6 +253,10 @@ const bodies=[];           // every animated body
 const pickables=[];        // meshes for raycasting
 let selected=null;
 
+// Touch devices: tapping a world focuses it but does NOT auto-open the big info
+// sheet — the ⓘ button (top-right) toggles it. Desktop keeps click-to-read.
+const MOBILE_UI = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
+
 const labelLayer=document.getElementById('labels');
 
 function makeAtmosphere(radius, color, strength){
@@ -430,6 +434,8 @@ function build(){
 
   controls=new THREE.OrbitControls(camera, renderer.domElement);
   controls.enableDamping=true; controls.dampingFactor=0.06;
+  // right-drag orbits exactly like left-drag (pan moved to middle-drag)
+  controls.mouseButtons={LEFT:THREE.MOUSE.ROTATE, MIDDLE:THREE.MOUSE.PAN, RIGHT:THREE.MOUSE.ROTATE};
   controls.minDistance=realScale?0.004:0.8; controls.maxDistance=40000;   // real mode: fly right up to a world
   controls.zoomSpeed=2.4;                  // wheel zooms further per notch
   controls.target.set(0,0,0);
@@ -488,9 +494,9 @@ function build(){
 
   // optional deep-link: index.html#satis focuses a body on load
   const hk=(location.hash||'').replace('#','').toLowerCase();
-  if(hk && bodies.some(b=>b.data.key===hk)) setTimeout(()=>focusBody(hk,true), 400);
+  if(hk && bodies.some(b=>b.data.key===hk)) setTimeout(()=>focusBody(hk,'force'), 400);
   window.addEventListener('hashchange',()=>{ const k=location.hash.replace('#','').toLowerCase();
-    if(bodies.some(b=>b.data.key===k)) focusBody(k,true); });
+    if(bodies.some(b=>b.data.key===k)) focusBody(k,'force'); });
 
   animate();
 }
@@ -885,6 +891,11 @@ function setupInteraction(){
   document.getElementById('reset').onclick=resetView;
   document.getElementById('close').onclick=closeInfo;
   document.getElementById('helpbtn').onclick=()=>document.getElementById('help').classList.toggle('open');
+  const ib=document.getElementById('infobtn');   // mobile: ⓘ toggles the info sheet
+  if(ib) ib.onclick=()=>{
+    if(document.getElementById('info').classList.contains('open')) closeInfo();
+    else{ const rec=bodies.find(b=>b.data.key===selected); if(rec) openInfo(rec.data); }
+  };
   const navbtn=document.getElementById('navbtn');
   if(navbtn) navbtn.onclick=()=>document.getElementById('nav').classList.toggle('open');
 
@@ -972,7 +983,8 @@ function focusBody(key, openPanel){
     if(rec.data.kind==='star') tween.dist = starVisR()*7;
   }
   selected=key; setActiveNav(key);
-  if(openPanel!==false) openInfo(rec.data);
+  // 'force' (deep links) always opens; plain true is suppressed on touch devices
+  if(openPanel==='force' || (openPanel!==false && !MOBILE_UI)) openInfo(rec.data);
 }
 
 /* ============================================================
@@ -1057,8 +1069,11 @@ function openInfo(d){
     if(verbatim){ addSource("From the source — author's text"); addParas(verbatim); }
   }
   document.getElementById('info').classList.add('open');
+  syncInfoBtn();
 }
-function closeInfo(){ document.getElementById('info').classList.remove('open'); setActiveNav(selected); }
+function syncInfoBtn(){ const ib=document.getElementById('infobtn');
+  if(ib) ib.classList.toggle('on', document.getElementById('info').classList.contains('open')); }
+function closeInfo(){ document.getElementById('info').classList.remove('open'); setActiveNav(selected); syncInfoBtn(); }
 
 function buildGlossary(){
   const el=document.getElementById('gloss');
