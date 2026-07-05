@@ -30,7 +30,7 @@ const YEARS_PER_SEC = 0.030;              // sim years per real second when time
 const SEC_PER_YEAR  = 31557600;           // 365.25 days
 const RATE_MIN_YPS  = 1/SEC_PER_YEAR;     // slider min = real-time (1 sim-second per real-second)
 const RATE_MAX_YPS  = 2.0;                // slider max ≈ 2 years / second
-const DEFAULT_RATE_YPS = 0.0006;          // ≈ 6 hours / second — gentle default motion
+const DEFAULT_RATE_YPS = RATE_MIN_YPS;    // default = true real-time (1 s/s; planets ~frozen)
 const rateToSlider = (yps)=> 100*Math.log(yps/RATE_MIN_YPS)/Math.log(RATE_MAX_YPS/RATE_MIN_YPS);
 const DEFAULT_SPEED_V = rateToSlider(DEFAULT_RATE_YPS);
 const DEFAULT_SIZE_V  = 100;             // Size slider value for the default body size (sizeMult = 1.0)
@@ -48,6 +48,20 @@ function bodyF(){ return realScale ? 0.5 : 1.0; }   // body-size factor for curr
 const KM_PER_AU = 1.495978707e8;          // km per astronomical unit
 const MIN_PIXELS = 3;                      // smallest on-screen body radius (px) in real mode
 function realRadiusScene(km){ return (km||1)/KM_PER_AU*AU_UNIT; }   // true radius in real-mode scene units
+// --- free-roam flight: real km <-> scene units, speed of light, throttle range (FTL) ---
+const KM_PER_UNIT = KM_PER_AU/AU_UNIT;     // real km per scene unit (≈ 1.36e6)
+const C_KMS = 299792.458;                  // speed of light, km/s
+const kmsToUnits = kms => kms/KM_PER_UNIT; // km/s -> scene units/s
+// Space-Engine-style CONTEXT-RELATIVE speed: full throttle scales with the distance to the
+// nearest body, so one slider flies well everywhere — gentle beside a planet, fast (FTL) in
+// deep space. The readout still shows real km/s (and flips to fractions of c past 30,000 km/s).
+const REACH_RATE   = 1.0;                  // full throttle crosses ~1× the nearest-body gap / sec
+const FLY_FLOOR_KMS = 2;                   // never totally stuck at a surface
+const FLY_CAP_KMS   = 5000*C_KMS;          // absolute speed ceiling (deep-space FTL cruise, AUTO mode)
+const FLY_KEY_FLOOR = 0.02;                // pressing a move key always gives ≥2% of full throttle
+// MANUAL speed mode (auto-scale off): slider maps to an absolute km/s over a huge, uncapped range
+const FLY_MANUAL_MIN = 1;                  // km/s at the low end of the slider
+const FLY_MANUAL_MAX = 100000*C_KMS;       // effectively unlimited — user's choice is not capped
 
 /* ============================================================
    Seeded value-noise / fbm for procedural planet textures
@@ -96,7 +110,11 @@ function ramp(stops,t){ // stops = array of rgb
 function clamp01(x){return x<0?0:x>1?1:x;}
 function smooth(e0,e1,x){ const t=clamp01((x-e0)/(e1-e0)); return t*t*(3-2*t); }
 
-const TXW=1024, TXH=512;
+// procedural body textures: on touch devices halve the resolution — this is the
+// biggest synchronous cost at load (multi-octave noise per body), and a real/baked
+// map swaps in over it anyway, so the placeholder can be lighter on phones/tablets
+const _COARSE = !!(typeof window!=='undefined' && window.matchMedia && matchMedia('(pointer: coarse)').matches);
+const TXW=_COARSE?512:1024, TXH=_COARSE?256:512;
 function newCanvas(w,h){ const c=document.createElement('canvas'); c.width=w; c.height=h; return c; }
 
 /* ---- gas giant / brown dwarf bands (seamless) ---- */
@@ -134,7 +152,7 @@ function texGas(palette, seed, opts){
 /* ---- rocky / lava / icy mottled (seamless, height-ramp shading) ---- */
 function texRocky(p, seed, opts){
   opts=opts||{};
-  const w=TXW,h=TXH,c=newCanvas(w,h),ctx=c.getContext('2d');
+  const w=opts.w||TXW,h=opts.h||TXH,c=newCanvas(w,h),ctx=c.getContext('2d');
   const img=ctx.createImageData(w,h),d=img.data;
   const fbm=makeNoise3(seed);
   // height ramp: dark lowlands -> base -> mid -> bright highlands
@@ -242,22 +260,248 @@ function texGlow(inner, outer){
 }
 
 /* ============================================================
+   Canvas-texture survival (Android): backgrounded tabs can have their
+   2D-canvas backing stores DISCARDED — image-based textures (the baked
+   .webp maps) reload fine, but every canvas-based texture (magma oceans,
+   scars, glow sprites…) comes back blank. A tiny sentinel canvas detects
+   the wipe on return and registered repainters restore the content.
+   ============================================================ */
+const _cvRepaint=[];
+let _cvSentinel=null;
+function regCanvasTex(tex, fn){ _cvRepaint.push({tex, fn}); return tex; }
+function unregCanvasTex(tex){
+  for(let i=_cvRepaint.length-1;i>=0;i--) if(_cvRepaint[i].tex===tex) _cvRepaint.splice(i,1);
+}
+function cvArmSentinel(){
+  if(!_cvSentinel) _cvSentinel=newCanvas(4,4);
+  const c=_cvSentinel.getContext('2d'); c.fillStyle='#fff'; c.fillRect(0,0,4,4);
+}
+function cvCheckRestore(){
+  if(!_cvSentinel) return;
+  let lost=false;
+  try{ lost=_cvSentinel.getContext('2d').getImageData(0,0,1,1).data[3]===0; }catch(_){ lost=true; }
+  if(!lost) return;
+  cvArmSentinel();
+  for(const r of _cvRepaint){ try{ r.fn(); r.tex.needsUpdate=true; }catch(_){ } }
+}
+document.addEventListener('visibilitychange',function(){
+  if(document.hidden){ if(typeof impBeam!=='undefined' && impBeam) stopBeam(); }  // don't let a held laser survive a tab-switch
+  else setTimeout(cvCheckRestore,60);
+});
+// a lost pointerup (clicking away from the window mid-hold) would otherwise leave the beam stuck on
+window.addEventListener('blur',function(){ if(typeof impBeam!=='undefined' && impBeam) stopBeam(); });
+/* glow-sprite texture that repaints itself after a canvas wipe */
+function glowCanvasTex(inner, outer){
+  const c=texGlow(inner,outer), t=new THREE.CanvasTexture(c);
+  regCanvasTex(t, function(){ c.getContext('2d').drawImage(texGlow(inner,outer),0,0); });
+  return t;
+}
+
+/* ============================================================
    Three.js scene
    ============================================================ */
 const APP = {};
+
+/* ---- which system? Ra (fictional) or our real Solar System (data-sol.js).
+   Chosen on the first-visit selection screen; the choice persists in
+   localStorage['ra-system'] and is applied here before build() runs. ---- */
+let SYS='ra', DS=null;
+function applySystem(sys){
+  SYS = (sys==='sol' && typeof SOL_SYSTEM!=='undefined') ? 'sol' : 'ra';
+  DS = SYS==='sol'
+    ? {STAR:SOL_SYSTEM.STAR, PLANETS:SOL_SYSTEM.PLANETS, MOONS:SOL_SYSTEM.MOONS,
+       HORUS:null, HORUS_MOONS:[], GLOSSARY:SOL_SYSTEM.GLOSSARY}
+    : {STAR:STAR, PLANETS:PLANETS, MOONS:MOONS, HORUS:HORUS, HORUS_MOONS:HORUS_MOONS, GLOSSARY:GLOSSARY};
+}
 let scene,camera,renderer,controls,clock;
 let playing=true, timeScale=1.0, sizeMult=1.0, showOrbits=true, showLabels=true, showTails=true;
 let elapsedYears=0, _clockT=0;    // accumulated sim-time + throttle timer for the clock readout
 let USE_VERBATIM = !!window.USE_VERBATIM;   // true = show only the author's own text
+
+/* ---- language: English default, Slovak via the 🌐 toggle (persisted).
+   All Slovak content lives in assets/lang-sk.js (LANG_SK); English strings
+   used from JS live in UI_EN below; static English HTML is cached from the
+   DOM on first switch so toggling back restores it. ---- */
+let LANG='en';
+try{ if(localStorage.getItem('ra-lang')==='sk') LANG='sk'; }catch(_){}
+const UI_EN={
+  'play':'▶ Play','pause':'⏸ Pause',
+  'rt':'real-time','u-yr':'yr/s','u-mo':'mo/s','u-day':'days/s','u-hr':'hr/s','u-min':'min/s','u-s':'s/s',
+  'e-yr':'yr','e-day':'days','e-hr':'hr','e-min':'min','e-s':'s',
+  'real-scale':'📏 Real scale','compressed':'📐 Compressed',
+  'authors-text':"📖 Author's text",'summary-source':'📖 Summary + source',
+  'type-star':'Star','type-bd':'Brown dwarf','type-moon':'Moon','type-planet':'Planet',
+  'nav-ra':'Ra System','nav-horus':'Horus subsystem',
+  'nav-sol':'The Solar System',
+  'title-sol-h1':'The <b>Solar</b> System',
+  'doc-title-sol':'The Solar System — Interactive 3D Simulation',
+  'sys-to-sol':'⇄ 🌍 Solar System','sys-to-ra':'⇄ ✨ Ra System','sys-change':'⇄ Change system',
+  'choose-title':'Choose a planetary system',
+  'choose-ra':'✨ The Ra System','choose-ra-sub':'A fictional world — “Satis v10”',
+  'choose-sol':'🌍 The Solar System','choose-sol-sub':'Our home — real planets &amp; moons',
+  'life-title':'harbours life','life-intelligent':'intelligent','life-alien':'alien','life-seeded':'seeded','life-native':'native',
+  'from-source':"From the source — author's text",
+  'no-desc':'(No description in the source document yet — summary shown.)',
+  'debris-type':'Debris field','debris-name-span':'destroyed','debris-tag':'A debris field.',
+  'st-status':'Status','st-destroyed':'☠ Destroyed','st-cause':'Cause','st-cause-v':'Bombardment (impact lab)',
+  'st-eabs':'Energy absorbed','st-ebind':'Binding energy',
+  'debris-epitaph':'{name} is gone. Its accumulated bombardment exceeded its gravitational binding energy and the world came apart. Where {name} once was, incandescent fragments and still-cooling ejecta drift apart — and Kepler shear is smearing them along the old orbit into a glittering debris ring. Speed up time to watch the arc close into a full ring.',
+  'heal-hint':'(🧽 Heal in the impact lab restores the planet.)',
+  'nav-destroyed':'destroyed',
+  'st-orbit-now':'Orbit (current)',
+  'st-mass-now':'Mass (current)',
+  'tier-massloss':' · mass −{p} %',
+  'st-ring':'Debris ring','st-ring-v':'☄ shearing along the old orbit',
+  'tier-puff-1':' · envelope: superheated, glowing',
+  'tier-puff-2':' · envelope: inflated like a hot Jupiter — gas escaping',
+  'tier-puff-3':' · envelope: streaming away — breakup imminent',
+  'imp-immune':' · immune to your weapons','imp-destroyed':' · ☠ destroyed — a debris field',
+  'imp-strike':'strike','imp-beam':'beam/s','imp-binding-over':'≥100% of binding ☠','imp-binding-of':'% of binding',
+  'imp-melts-sea':' · melts a ~{km} km lava sea',
+  'tier-crater':' · surface: cratered','tier-seas':' · surface: scattered melt seas',
+  'tier-thaw':' · thawing — seas of liquid water ({p}%)',
+  'tier-thaw-polar':' · thawing — polar seas ({p}%)',
+  'tier-steam':' · oceans boiling — steam atmosphere ({p}%)',
+  'tier-regional':' · surface: regional melting ({p}% molten)','tier-ocean':' · surface: global magma ocean ({p}% molten)',
+  'tier-molten':' · surface: fully molten, superheated','tier-white':' · surface: white-hot — breakup imminent',
+  'imp-w-ast':'☄ Asteroid','imp-w-las':'🔆 Laser',
+  'imp-hint-ast':'Click a world to strike it · scars persist · enough total energy shatters a crust',
+  'imp-hint-las':'Press & hold to fire · drag to sweep the beam across worlds · release to stop',
+  'mat-0':'🧊 Ice','mat-1':'🪨 Rock','mat-2':'⛓ Iron',
+  'fly-notarget':'◎ no target — tap a world',
+  'doc-title':'The Ra System — Interactive 3D Simulation'
+};
+function T(k){
+  if(LANG==='sk' && typeof LANG_SK!=='undefined' && LANG_SK.ui[k]!=null) return LANG_SK.ui[k];
+  return UI_EN[k]!=null?UI_EN[k]:k;
+}
+function locData(d){ return (LANG==='sk' && typeof LANG_SK!=='undefined' && LANG_SK.data[d.key])||null; }
+function locTagline(d){ const l=locData(d); return (l&&l.tagline)||d.tagline; }
+function locDesc(d){ const l=locData(d); return (l&&l.desc)||d.desc; }
+function locStats(d){ const l=locData(d); return (l&&l.stats)||d.stats; }
+function locCaption(d,i,cap){ const l=locData(d); return (l&&l.images&&l.images[i])||cap; }
+function locVerbatim(key){
+  if(LANG==='sk' && typeof LANG_SK!=='undefined' && LANG_SK.verbatim[key]) return LANG_SK.verbatim[key];
+  return (typeof DESCRIPTIONS_VERBATIM!=='undefined')?DESCRIPTIONS_VERBATIM[key]:null;
+}
+function locName(d){
+  if(LANG==='sk' && typeof LANG_SK!=='undefined'){
+    const l=LANG_SK.data[d.key]; if(l && l.name) return l.name;
+  }
+  return d.name;
+}
+const _staticEn={};
+function applyStaticLang(){
+  if(typeof LANG_SK==='undefined') return;
+  for(const id in LANG_SK.html){
+    const el=document.getElementById(id); if(!el) continue;
+    if(!(id in _staticEn)) _staticEn[id]=el.innerHTML;
+    el.innerHTML = LANG==='sk' ? LANG_SK.html[id] : _staticEn[id];
+  }
+  for(const id in (LANG_SK.titles||{})){
+    const el=document.getElementById(id); if(!el) continue;
+    const k='t:'+id; if(!(k in _staticEn)) _staticEn[k]=el.getAttribute('title')||'';
+    el.setAttribute('title', LANG==='sk'?LANG_SK.titles[id]:_staticEn[k]);
+  }
+  document.title=T('doc-title');
+  applySysTitles();
+}
+function applySysTitles(){
+  if(SYS!=='sol') return;
+  const h=document.getElementById('title-h1'); if(h) h.innerHTML=T('title-sol-h1');
+  document.title=T('doc-title-sol');
+}
+function updateLangBtn(){ const b=document.getElementById('t-lang'); if(b) b.textContent = LANG==='sk'?'🌐 EN':'🌐 SK'; }
+function setLang(l){
+  LANG = (l==='sk' && typeof LANG_SK!=='undefined') ? 'sk' : 'en';
+  try{ localStorage.setItem('ra-lang',LANG); }catch(_){}
+  applyStaticLang(); updateLangBtn();
+  const nav=document.getElementById('nav');
+  if(nav){ nav.innerHTML=''; buildNav(); setActiveNav(selected);
+    for(const r of bodies) if(r.destroyed) updateNavStatus(r); }
+  buildGlossary();
+  const pb=document.getElementById('play'); if(pb) pb.innerHTML=playing?T('pause'):T('play');
+  const sb=document.getElementById('t-scale'); if(sb) sb.innerHTML=realScale?T('real-scale'):T('compressed');
+  const tb=document.getElementById('t-text'); if(tb) tb.innerHTML=USE_VERBATIM?T('authors-text'):T('summary-source');
+  const sp=document.getElementById('speed'); if(sp) setSpeed(+sp.value);
+  const sysb=document.getElementById('t-system');
+  if(sysb) sysb.innerHTML = T('sys-change');
+  for(const r of bodies){ const el=labelEls[r.data.key];
+    if(el) el.textContent=locName(r.data)+(r.destroyed?' ☠':''); }
+  if(typeof updateImpactUI==='function') updateImpactUI();
+  if(APP.currentData && document.getElementById('info').classList.contains('open')) openInfo(APP.currentData);
+}
 const bodies=[];           // every animated body
 const pickables=[];        // meshes for raycasting
 let selected=null;
 
 // Touch devices: tapping a world focuses it but does NOT auto-open the big info
 // sheet — the ⓘ button (top-right) toggles it. Desktop keeps click-to-read.
-const MOBILE_UI = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
+const MOBILE_UI = _COARSE;   // touch device (see _COARSE near the texture-size constants)
+
+// --- impact lab state (💥 button; module lives before the Animation section) ---
+let impacting=false, impWeapon='asteroid', impDiaKm=10, impSpdKms=30, impRho=3000, impPowW=1e18, impInfoT=0;
+
+// --- free-roam flight state ---
+let flying=false, flyModel='flycam', flyAutoSpeed=true, throttleFrac=0, throttleKms=0, autoOrient=false, flyThrust=0;
+const flyVel=new THREE.Vector3();              // current velocity (scene units/s), shared by all models
+const flyEuler=new THREE.Euler(0,0,0,'YXZ');   // look orientation: y=yaw, x=pitch, z=roll
+let flyTarget=null, flyFollow=null, flyGoto=null;
+const _flyPrevTarget=new THREE.Vector3();
+const flyKeys={};
 
 const labelLayer=document.getElementById('labels');
+
+/* flat banded annulus in the planet's equator plane (Saturn). The band
+   strip is a seeded 1D canvas (registered for Android canvas-wipe replay);
+   UVs are remapped radially so the strip reads as concentric rings. */
+function makeBodyRings(rec){
+  const cfg=rec.data.rings;
+  const inner=rec.radius*cfg.inner, outer=rec.radius*cfg.outer;
+  const geo=new THREE.RingGeometry(inner,outer,96,1);
+  const pos=geo.attributes.position, uv=geo.attributes.uv;
+  for(let i=0;i<pos.count;i++){
+    const r=Math.hypot(pos.getX(i),pos.getY(i));
+    uv.setXY(i,(r-inner)/(outer-inner),0.5);
+  }
+  const cv=newCanvas(512,4);
+  const paint=()=>{
+    const ctx=cv.getContext('2d');
+    ctx.clearRect(0,0,512,4);
+    let sd=1234567;
+    const rnd=()=>{ sd=(sd*1103515245+12345)>>>0; return sd/4294967296; };
+    for(let x=0;x<512;x++){
+      const f=x/512;
+      let a=0.55+0.45*Math.sin(f*40+rnd()*2)*rnd();         // fine ringlets
+      a*=0.35+0.65*Math.min(1,f*6)*(1-Math.pow(f,3)*0.35);  // dim inner edge, soft outer
+      if(f>0.66 && f<0.74) a*=0.10;                          // Cassini division
+      if(f<0.06) a*=0.3;
+      ctx.fillStyle=cfg.color||'#d8c9a6';
+      ctx.globalAlpha=Math.max(0,Math.min(1,a))*0.9;
+      ctx.fillRect(x,0,1,4);
+    }
+  };
+  paint();
+  const t=new THREE.CanvasTexture(cv);
+  const m=new THREE.Mesh(geo,new THREE.MeshBasicMaterial({map:t,side:THREE.DoubleSide,
+    transparent:true,depthWrite:false,opacity:0.95}));
+  // only repaint the procedural strip while it's still the live map (a real photo
+  // may swap in below) — mirrors buildBodyMesh's guarded canvas-wipe repaint
+  regCanvasTex(t, function(){ if(m.material.map!==t) return; paint(); });
+  m.rotation.x=Math.PI/2;
+  m.renderOrder=1;
+  rec.mesh.add(m);
+  rec.ringsMesh=m;
+  // opt-in real ring photo (assets/img/textures/<key>_rings.webp: RGBA strip,
+  // inner edge at u=0 — the radial UVs above sample it by radius). Falls back
+  // to the procedural strip on any miss, just like the body maps.
+  if(typeof window!=='undefined' && window.USE_AI_TEXTURES){
+    new THREE.TextureLoader().load('assets/img/textures/'+rec.data.key+'_rings.webp',
+      function(rt){ rt.anisotropy=4; m.material.map=rt; m.material.opacity=1; m.material.needsUpdate=true; t.dispose(); },
+      undefined, function(){ /* keep procedural rings */ });
+  }
+  return m;
+}
 
 function makeAtmosphere(radius, color, strength){
   const mat=new THREE.ShaderMaterial({
@@ -277,23 +521,34 @@ function makeAtmosphere(radius, color, strength){
 function buildBodyMesh(data, radius){
   const seed = (data.key||'x').split('').reduce((a,ch)=>a*31+ch.charCodeAt(0),7)>>>0;
   const geo=new THREE.SphereGeometry(radius, 64, 48);
-  let mat, emap=null;
-  let tex;
-  if(data.kind==='star'){
-    tex=texStar(["#ffb347","#ffe9b0","#fff8ee","#ffdf9a"], seed);
-  }else if(data.kind==='gasgiant'||data.kind==='browndwarf'){
-    tex=texGas(data.palette||["#888","#bbb","#666"], seed, {turb:0.06,streak:0.18});
-  }else if(data.kind==='lava'){
-    const r=texRocky(data.rocky, seed, {glow:'#ffb84a', emissData:true});
-    tex=r.map; emap=r.emap;
-  }else if(data.terran){
-    tex=texTerran(data.terran, seed);
-  }else if(data.rocky){
-    tex=texRocky(data.rocky, seed, {ice:data.terran&&data.terran.ice});
-  }else{ // iceworld with palette
-    tex=texGas(data.palette||["#9ab","#cde","#8aa"], seed, {turb:0.08,streak:0.10});
-  }
+  let mat;
+  const gen=()=>{                          // deterministic — reused to repaint after a canvas wipe
+    let tex, emap=null;
+    if(data.kind==='star'){
+      tex=texStar(["#ffb347","#ffe9b0","#fff8ee","#ffdf9a"], seed);
+    }else if(data.kind==='gasgiant'||data.kind==='browndwarf'){
+      tex=texGas(data.palette||["#888","#bbb","#666"], seed, {turb:0.06,streak:0.18});
+    }else if(data.kind==='lava'){
+      const r=texRocky(data.rocky, seed, {glow:'#ffb84a', emissData:true});
+      tex=r.map; emap=r.emap;
+    }else if(data.terran){
+      tex=texTerran(data.terran, seed);
+    }else if(data.rocky){
+      tex=texRocky(data.rocky, seed, {ice:data.terran&&data.terran.ice});
+    }else{ // iceworld with palette
+      tex=texGas(data.palette||["#9ab","#cde","#8aa"], seed, {turb:0.08,streak:0.10});
+    }
+    return {tex, emap};
+  };
+  const g0=gen();
+  const tex=g0.tex, emap=g0.emap;
   const map=new THREE.CanvasTexture(tex); map.anisotropy=4;
+  regCanvasTex(map, function(){            // only if the procedural map is still the live one
+    if(!mat || mat.map!==map) return;
+    const g=gen(); tex.getContext('2d').drawImage(g.tex,0,0);
+    if(emap && mat.emissiveMap && mat.emissiveMap.image===emap){
+      emap.getContext('2d').drawImage(g.emap,0,0); mat.emissiveMap.needsUpdate=true; }
+  });
   if(data.kind==='star'){
     mat=new THREE.MeshBasicMaterial({map});
   }else{
@@ -305,12 +560,12 @@ function buildBodyMesh(data, radius){
     if(emap){ mat.emissiveMap=new THREE.CanvasTexture(emap); mat.emissive=new THREE.Color(0xffffff);
       mat.emissiveIntensity=data.emissiveScale||0.5; }
   }
-  // Baked surface textures (index.html sets window.USE_AI_TEXTURES; on by default).
+  // Experimental: opt-in AI textures (index-ai.html sets window.USE_AI_TEXTURES).
   // The procedural map above shows instantly; if a baked image exists we swap it in,
   // and on any miss/error we silently keep the procedural texture.
   if(typeof window!=='undefined' && window.USE_AI_TEXTURES){
     new THREE.TextureLoader().load(
-      'assets/img/textures/'+data.key+'.jpg',
+      'assets/img/textures/'+data.key+'.webp',
       function(t){
         t.anisotropy=4; t.wrapS=map.wrapS; t.wrapT=map.wrapT;
         if(map.encoding!==undefined) t.encoding=map.encoding;
@@ -414,7 +669,26 @@ function inclFor(key){ // small deterministic inclinations for a 3D look
 }
 function nodeFor(key){ let s=0; for(const ch of key) s+=ch.charCodeAt(0); return (s*53)%360; }
 
-function build(){
+/* Hide the loading overlay. The critical part (opacity 0 + no pointer capture)
+   is applied SYNCHRONOUSLY so it never waits on a setTimeout — mobile browsers
+   throttle timers hard when you switch apps mid-load, which used to leave the
+   loader stuck on screen even though the sim had finished building. */
+function hideLoader(){
+  const l=document.getElementById('loader'); if(!l) return;
+  l.style.opacity='0'; l.style.pointerEvents='none';      // immediate: page is usable now
+  const gone=()=>{ l.style.display='none'; };
+  l.addEventListener('transitionend', gone, {once:true});
+  setTimeout(gone, 1000);                                 // fallback cleanup (fade is 0.8s)
+}
+/* If build() ever throws, don't leave an eternal spinner — surface the error. */
+function showLoadError(err){
+  const l=document.getElementById('loader'); if(!l) return;
+  const p=document.getElementById('loader-sub');
+  if(p){ p.textContent='Load error — '+((err&&err.message)||err||'unknown'); p.style.color='#ff9d8a'; }
+  const sp=l.querySelector('.spin'); if(sp) sp.style.display='none';
+}
+function build(){ try{ buildInner(); } catch(err){ showLoadError(err); throw err; } }
+function buildInner(){
   scene=new THREE.Scene();
   scene.background=new THREE.Color(0x04060c);
 
@@ -452,45 +726,56 @@ function build(){
   // ---- Ra ---- (star visuals live in starGroup so they can be scaled per mode)
   sunHolder=new THREE.Object3D(); scene.add(sunHolder);
   starGroup=new THREE.Object3D(); sunHolder.add(starGroup);
-  sunMesh=buildBodyMesh(STAR, STAR_R_COMPRESS); starGroup.add(sunMesh); pickables.push(sunMesh);
+  sunMesh=buildBodyMesh(DS.STAR, STAR_R_COMPRESS); starGroup.add(sunMesh); pickables.push(sunMesh);
   addStarGlow(starGroup, STAR_R_COMPRESS, '#fffaf0', '#ffdf9a', 5.4);
-  bodies.push({data:STAR, holder:sunHolder, mesh:sunMesh, orbitLine:null, radius:STAR_R_COMPRESS,
-    aDisp:0, e:0, q:new THREE.Quaternion(), period:1, M:0, spin:0.35/STAR.rotationPeriod,
+  bodies.push({data:DS.STAR, holder:sunHolder, mesh:sunMesh, orbitLine:null, radius:STAR_R_COMPRESS,
+    aDisp:0, e:0, q:new THREE.Quaternion(), period:1, M:0, spin:0.35/DS.STAR.rotationPeriod,
     parentHolder:scene, helio:false});
 
   // ---- planets ----
-  for(const p of PLANETS){
-    addBody(p, sunHolder, { aDisp:distDisp(p.dist), incl:inclFor(p.key), node:nodeFor(p.key), orbitOpacity:0.34 });
+  for(const p of DS.PLANETS){
+    addBody(p, sunHolder, { aDisp:distDisp(p.dist), incl:(p.incl!=null?p.incl:inclFor(p.key)),
+      node:nodeFor(p.key), orbitOpacity:0.34 });
   }
   // ---- moons of planets ----
-  for(const m of MOONS){
+  for(const m of DS.MOONS){
     const parent=bodies.find(b=>b.data.key===m.parent);
     if(!parent) continue;
     addMoon(m, parent);
   }
 
-  // ---- Horus + its moons ----
-  horusRec=addBody(HORUS, sunHolder, { aDisp:distDisp(HORUS.dist), incl:inclFor('horus'), node:nodeFor('horus'),
-                    radius:sizeDisp(HORUS.radiusKm), orbitOpacity:0.28 });
-  horusHolder=horusRec.holder;
-  addStarGlow(horusRec.mesh, horusRec.radius, '#ff7a44', '#7a1c08', 2.4);  // glow scales with mesh
-  const hLight=new THREE.PointLight(0xff5a2a, aiTex?0.55:0.9, horusRec.radius*70, 1.2);
-  horusRec.mesh.add(hLight);
-  for(const m of HORUS_MOONS){ addMoon(m, horusRec); }
+  // ---- Horus + its moons (Ra system only) ----
+  if(DS.HORUS){
+    horusRec=addBody(DS.HORUS, sunHolder, { aDisp:distDisp(DS.HORUS.dist), incl:inclFor('horus'), node:nodeFor('horus'),
+                      radius:sizeDisp(DS.HORUS.radiusKm), orbitOpacity:0.28 });
+    horusHolder=horusRec.holder;
+    addStarGlow(horusRec.mesh, horusRec.radius, '#ff7a44', '#7a1c08', 2.4);  // glow scales with mesh
+    const hLight=new THREE.PointLight(0xff5a2a, aiTex?0.55:0.9, horusRec.radius*70, 1.2);
+    horusRec.mesh.add(hLight);
+    for(const m of DS.HORUS_MOONS){ addMoon(m, horusRec); }
+  }
+  // ring systems (Saturn) — a flat banded annulus in the equator plane
+  for(const rec of bodies) if(rec.data.rings) makeBodyRings(rec);
 
   // evaporation tails (bodies flagged evapTail in data.js — planets and moons)
   for(const rec of bodies) if(rec.data.evapTail) makeEvapTail(rec);
 
+  cvArmSentinel();                                        // Android canvas-wipe detector
+  renderer.domElement.addEventListener('webglcontextrestored', ()=>setTimeout(cvCheckRestore,60));
   buildNav(); buildGlossary();
+  applySysTitles();
+  if(SYS==='sol'){ const tb=document.getElementById('t-text'); if(tb) tb.style.display='none'; }
+  // language toggle (English default; Slovak from assets/lang-sk.js)
+  const lb=document.getElementById('t-lang');
+  if(lb) lb.onclick=function(){ setLang(LANG==='sk'?'en':'sk'); };
+  if(LANG==='sk') setLang('sk'); else updateLangBtn();
   window.addEventListener('resize', onResize);
   setupInteraction();
 
   applyScaleMode();   // sets star size, body sizes, orbit radii for the current mode
   frameSystem();      // place the camera for the current mode
 
-  // hide loader
-  setTimeout(()=>{ const l=document.getElementById('loader'); l.style.opacity=0;
-    setTimeout(()=>l.style.display='none',800); }, 150);
+  hideLoader();       // synchronous — never depends on a throttled timer (mobile app-switch)
 
   // optional deep-link: index.html#satis focuses a body on load
   const hk=(location.hash||'').replace('#','').toLowerCase();
@@ -503,7 +788,7 @@ function build(){
 
 function addMoon(m, parentRec){
   // per-subsystem display distance
-  const sysMoons = (parentRec.data.key==='horus')?HORUS_MOONS:MOONS.filter(x=>x.parent===parentRec.data.key);
+  const sysMoons = (DS.HORUS && parentRec.data.key===DS.HORUS.key)?DS.HORUS_MOONS:DS.MOONS.filter(x=>x.parent===parentRec.data.key);
   const refDist = Math.min.apply(null, sysMoons.map(x=>x.dist));
   const spacing = Math.max(2.2, parentRec.radius*0.95);
   // compressed: tuned for visibility; real: the moon's TRUE distance from its parent
@@ -524,12 +809,12 @@ function addMoon(m, parentRec){
 /* ---- scale mode (compressed <-> real distances) ---- */
 function applySizes(){
   for(const rec of bodies){ if(rec.data.kind==='star') continue;
-    rec.mesh.scale.setScalar(sizeMult*bodyF()); }
+    rec.mesh.scale.setScalar(sizeMult*bodyF()*(rec.puffK||1)); }
 }
 function applyScaleMode(){
   starGroup.scale.setScalar(starVisR()/STAR_R_COMPRESS);
   for(const rec of bodies){
-    if(rec.helio){ rec.aDisp=distDisp(rec.data.dist); rebuildOrbitLine(rec); }
+    if(rec.helio){ rec.aDisp=distDisp(rec.helioA!=null?rec.helioA:rec.data.dist); rebuildOrbitLine(rec); }
     else if(rec.isMoon){ rec.aDisp = realScale?rec.aDispReal:rec.aDispCompressed; rebuildOrbitLine(rec); }
   }
   applySizes();
@@ -546,14 +831,15 @@ function frameSystem(){
 }
 function updateScaleUI(){
   const b=document.getElementById('t-scale');
-  if(b){ b.classList.toggle('on', realScale); b.innerHTML = realScale?'📏 Real scale':'📐 Compressed'; }
+  if(b){ b.classList.toggle('on', realScale); b.innerHTML = realScale?T('real-scale'):T('compressed'); }
 }
 function updateTextUI(){
   const b=document.getElementById('t-text');
   if(b){ b.classList.toggle('on', USE_VERBATIM);
-    b.innerHTML = USE_VERBATIM ? "📖 Author's text" : "📖 Summary + source"; }
+    b.innerHTML = USE_VERBATIM ? T('authors-text') : T('summary-source'); }
 }
 function setScaleMode(real){
+  if(!real && flying) exitFly();     // Compressed is the overview map — leave free-roam
   realScale=real;
   applyScaleMode();
   frameSystem();
@@ -561,16 +847,14 @@ function setScaleMode(real){
 
 function addStarGlow(holder, r, inner, outer, scale){
   // depthTest:true so planets in front of the star occlude its glow (no see-through wash)
-  const c=texGlow(rgbaStr(inner,1), rgbaStr(outer,0.55));
-  const map=new THREE.CanvasTexture(c);
+  const map=glowCanvasTex(rgbaStr(inner,1), rgbaStr(outer,0.55));
   const sp=new THREE.Sprite(new THREE.SpriteMaterial({map, color:0xffffff, transparent:true,
     blending:THREE.AdditiveBlending, depthWrite:false, depthTest:true}));
   sp.scale.set(r*scale, r*scale, 1);
   holder.add(sp);
   // soft inner corona
-  const c2=texGlow(rgbaStr(inner,0.9), rgbaStr(inner,0.0));
-  const sp2=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c2), transparent:true,
-    blending:THREE.AdditiveBlending, depthWrite:false, depthTest:true}));
+  const sp2=new THREE.Sprite(new THREE.SpriteMaterial({map:glowCanvasTex(rgbaStr(inner,0.9), rgbaStr(inner,0.0)),
+    transparent:true, blending:THREE.AdditiveBlending, depthWrite:false, depthTest:true}));
   sp2.scale.set(r*scale*0.55, r*scale*0.55,1); holder.add(sp2);
 }
 function rgbaStr(hex,a){ const [r,g,b]=hex2rgb(hex); return `rgba(${r|0},${g|0},${b|0},${a})`; }
@@ -608,10 +892,11 @@ const EVAP_LEN_RADII=2.6;     // compressed mode: tail length in (exaggerated) p
 const EVAP_MAX_EMIT=256;      // per-frame emission cap (extreme time speeds recycle instead)
 const _evP=new THREE.Vector3(), _evD=new THREE.Vector3(), _evR=new THREE.Vector3();
 
-function makeEvapTail(rec){
+function makeEvapTail(rec, cfgOverride){
   // per-body config: evapTail:true = Amunet-strength defaults; or {alpha,rate,len} to soften.
   // data.tail (hex) tints the plume — e.g. Sekhmet's sulfur-orange.
-  const cfg=(typeof rec.data.evapTail==='object')?rec.data.evapTail:{};
+  // cfgOverride: dynamically-created tails (impact-heated gas giants shedding envelope).
+  const cfg=cfgOverride || ((typeof rec.data.evapTail==='object')?rec.data.evapTail:{});
   const tint=rec.data.tail!=null?new THREE.Color(rec.data.tail):null;
   const colA=tint?tint.clone().lerp(new THREE.Color(1,1,1),0.65):new THREE.Color(1.0,0.93,0.76);
   const colB=tint?tint.clone():new THREE.Color(0.95,0.62,0.30);
@@ -684,6 +969,8 @@ function updateEvapTails(simDt){   // simDt = sim-years advanced this frame (0 w
   if(!showTails) return;
   for(const t of evapTails){
     const rec=t.rec;
+    if(rec.destroyed){ if(t.points.visible) t.points.visible=false; continue; }   // debris doesn't outgas
+    if(!t.points.visible) t.points.visible=true;
     if(rec.aDisp!==t.lastADisp){   // scale mode flipped — old positions are meaningless
       t.ageYr.fill(1); t.lifeYr.fill(1); t.age01.fill(1);
       t.lastADisp=rec.aDisp; t.prevM=rec.M; t.emitAcc=0;
@@ -746,6 +1033,1565 @@ function updateEvapTails(simDt){   // simDt = sim-years advanced this frame (0 w
 }
 
 /* ============================================================
+   Impact lab — customizable asteroid strikes + giant laser (💥).
+   Direct fire: click a world = asteroid at that spot; press-and-
+   hold = laser (the world rotates under the frozen beam, smearing
+   a burn line). Wall-clock driven — works while the sim is paused.
+   Damage persists as scars painted onto per-body overlay spheres;
+   when a body's accumulated energy exceeds its gravitational
+   binding energy (3GM²/5R), its crust shatters into a molten
+   remnant. Ra and Horus are immune (flare visual only).
+   ============================================================ */
+const IMP_CHICXULUB_J=4.2e23, IMP_MT_TNT_J=4.184e15, IMP_G=6.674e-11;
+const IMP_MATS=[['🧊 Ice',920],['🪨 Rock',3000],['⛓ Iron',7870]];
+const impDensityByKind={ star:1400, browndwarf:8e4, gasgiant:1300, terran:5200, rocky:4500,
+                         lava:4800, ocean:3500, iceworld:2000, icemoon:1900 };
+let impMatI=1;
+const impAsteroids=[], impFx=[], impScarred=[];
+let impBeam=null, impShake=0, impPool=null, impPoolActiveT=0;
+let _impFlashTex=null, _impRingTex=null;
+// baked rock albedo (gpt-image-2) for asteroids + debris chunks; falls back to
+// flat colours if the file is missing. Preloaded on entering impact mode.
+let _impRockTex=null, _impRockReq=false, _astGlowTex=null;
+function impRockTex(){
+  if(!_impRockReq){ _impRockReq=true;
+    new THREE.TextureLoader().load('assets/img/textures/debris.webp',
+      function(t){ _impRockTex=t; if(_astMat){ _astMat.map=t; _astMat.color.setHex(0xffffff); _astMat.needsUpdate=true; } },
+      undefined, function(){});
+  }
+  return _impRockTex;
+}
+/* ---- asteroid render pools: geometry/material/sprites are reused across strikes
+   instead of allocated + disposed per shot, which was causing GC/GPU hitches on
+   tablets. Identical visuals (6 shape variants + random tumble/scale). ---- */
+let _astRockGeos=null, _astMat=null, _astGlowMat=null;
+const _astRigPool=[], _flashPool=[], _shockPool=[];
+function astRockGeos(){
+  if(_astRockGeos) return _astRockGeos;
+  _astRockGeos=[]; for(let i=0;i<6;i++) _astRockGeos.push(makeRockGeo(11,8,(0x9e37+i*0x61c88647)>>>0));
+  return _astRockGeos;
+}
+function astMaterial(){
+  if(_astMat) return _astMat;
+  const t=impRockTex();
+  _astMat=new THREE.MeshStandardMaterial({map:t||null, color:t?0xffffff:0x8a7767, roughness:0.95, emissive:0x1c0e06});
+  return _astMat;
+}
+function astGlowMat(){
+  if(_astGlowMat) return _astGlowMat;
+  const glowMap=_astGlowTex||(_astGlowTex=glowCanvasTex('rgba(255,190,120,0.9)','rgba(255,110,40,0.32)'));
+  _astGlowMat=new THREE.SpriteMaterial({map:glowMap,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false});
+  return _astGlowMat;
+}
+function acquireAstRig(){
+  let rig=_astRigPool.pop();
+  if(!rig){ const mesh=new THREE.Mesh(astRockGeos()[0], astMaterial());
+    const sp=new THREE.Sprite(astGlowMat()); sp.scale.setScalar(5); mesh.add(sp);
+    rig={mesh}; scene.add(mesh); }
+  const geos=astRockGeos();
+  rig.mesh.geometry=geos[(Math.random()*geos.length)|0];   // random shape for variety
+  rig.mesh.rotation.set(Math.random()*6.28,Math.random()*6.28,Math.random()*6.28);
+  rig.mesh.visible=true;
+  return rig;
+}
+function releaseAstRig(rig){ rig.mesh.visible=false; _astRigPool.push(rig); }
+/* pooled one-shot fx sprite (flash/shock): grab an idle one, or make a new one */
+function acquireFxSprite(pool, tex){
+  let sp=pool.pop();
+  if(!sp){ sp=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,transparent:true,
+    blending:THREE.AdditiveBlending,depthWrite:false})); scene.add(sp); }
+  sp.visible=true; sp.material.opacity=1;
+  return sp;
+}
+const impRC=new THREE.Raycaster();
+const _impV1=new THREE.Vector3(), _impV2=new THREE.Vector3(), _impV3=new THREE.Vector3();
+
+function impBodyMassKg0(rec){                               // original (undamaged) mass
+  if(rec.data.massKg) return rec.data.massKg;               // exact, from the author's .ubox
+  const R=(rec.data.radiusKm||1000)*1000;
+  return (impDensityByKind[rec.data.kind]||3500)*(4/3)*Math.PI*R*R*R; }
+/* ---- mass loss: once a world is superheated, further energy boils material
+   off into space (the escaping tail). Stateless, from cumulative dmgJ:
+   rocky worlds lose mass past the whole-body melt budget, paying vaporization
+   + escape energy per kg; a puffed giant's envelope only has to be lifted. */
+const IMP_VAP_EJKG={icemoon:3.2e6, iceworld:3.2e6, ocean:5e6};  // J/kg to heat + vaporize; rock default
+function impVapEJkg(rec){
+  const c=rec.data.comp;
+  if(c) return Math.max(8e5, 1.4e7*((c.rock||0)+(c.iron||0)) + 3.1e6*(c.water||0) + 5e5*(c.gas||0));
+  return IMP_VAP_EJKG[rec.data.kind]||1.4e7;
+}
+function impMassLostKg(rec){
+  if(!(rec.dmgJ>0)||impImmune(rec)) return 0;
+  const M0=impBodyMassKg0(rec), R=(rec.data.radiusKm||1000)*1000;
+  const eEsc=IMP_G*M0/R;
+  let over, eKg;
+  if(rec.data.kind==='gasgiant'){                           // loss starts with the escaping-gas tail
+    over=(rec.dmgJ||0)-0.05*(3*IMP_G*M0*M0/(5*R)); eKg=eEsc;
+  } else {
+    const U0=3*IMP_G*M0*M0/(5*R);
+    const P=impMeltPhases(rec);
+    let lost=0;
+    if(P.W>0){                                              // water worlds shed STEAM first:
+      const ov2=(rec.dmgJ||0)-P.E2;                         // once the oceans have boiled, ~35% of
+      if(ov2>0) lost+=Math.min(0.8*P.W*M0, 0.35*ov2/eEsc);  // further energy lofts vapor to escape
+    }
+    // rock vapor only once superheated: fully molten, or (small cold moons) nearing breakup
+    over=(rec.dmgJ||0)-Math.min(P.E3, 0.25*U0); eKg=impVapEJkg(rec)+eEsc;
+    if(over>0) lost+=over/eKg;
+    return Math.min(0.5*M0, lost);                          // ≥ that and breakup wins anyway
+  }
+  if(over<=0) return 0;
+  return Math.min(0.5*M0, over/eKg);                        // ≥ that and breakup wins anyway
+}
+function impBodyMassKg(rec){ return impBodyMassKg0(rec)-impMassLostKg(rec); }
+function impMassNowTxt(rec){                                // "1.98 M⊕ (−3.2 %)" for the info panel
+  const M0=impBodyMassKg0(rec), M=impBodyMassKg(rec), lf=1-M/M0;
+  const me=M/5.972e24;
+  const mtxt = me>=0.01 ? (+me.toPrecision(3))+' M⊕' : M.toExponential(2).replace('e+','e')+' kg';
+  const p = lf<0.10 ? (lf*100).toFixed(1) : String(Math.round(lf*100));
+  return mtxt+' (−'+p+' %)';
+}
+function impBodyRho(rec){ const R=(rec.data.radiusKm||1000)*1000;
+  return impBodyMassKg0(rec)/((4/3)*Math.PI*R*R*R); }       // bulk density of the surviving body
+/* what fraction of a disrupted body flashes to gas: its H/He envelope plus
+   its water (steam, at breakup temperatures) — from the .ubox depots */
+function impGasFrac(rec){
+  if(rec.data.comp) return Math.min(0.97,(rec.data.comp.gas||0)+(rec.data.comp.water||0));
+  if(rec.data.debrisGas!=null) return rec.data.debrisGas;
+  const GK={gasgiant:0.8, browndwarf:0.9, ocean:0.35, iceworld:0.3, icemoon:0.3, terran:0.22, lava:0.1, rocky:0.12};
+  return GK[rec.data.kind]!=null?GK[rec.data.kind]:0.2;
+}
+function impBindingJ(rec){ const R=(rec.data.radiusKm||1000)*1000, M=impBodyMassKg(rec);
+  return 3*IMP_G*M*M/(5*R); }
+function impImmune(rec){ return rec.data.kind==='star'||rec.data.kind==='browndwarf'; }
+function impKE(){ return 0.5*impRho*(Math.PI/6)*Math.pow(impDiaKm*1000,3)*Math.pow(impSpdKms*1000,2); }
+
+/* Lumpy-rock geometry: displace a sphere by smooth 3D noise of each vertex's
+   DIRECTION. Seam/pole vertices are duplicated in SphereGeometry — noise keyed
+   on position moves the duplicates identically, keeping the mesh watertight
+   (per-vertex random jitter tore it open like crumpled paper). */
+function makeRockGeo(wSeg,hSeg,seed){
+  const g=new THREE.SphereGeometry(1,wSeg,hSeg), pa=g.attributes.position;
+  const fbm=makeNoise3(seed>>>0), v=new THREE.Vector3();
+  for(let i=0;i<pa.count;i++){
+    v.set(pa.getX(i),pa.getY(i),pa.getZ(i)).normalize();
+    const f=0.84 + 0.30*fbm(v.x*1.6+3.7, v.y*1.6+3.7, v.z*1.6+3.7, 4)
+                 + 0.07*fbm(v.x*4.5, v.y*4.5, v.z*4.5, 3);
+    pa.setXYZ(i, v.x*f, v.y*f, v.z*f);
+  }
+  g.computeVertexNormals();
+  return g;
+}
+
+/* Three's SphereGeometry: phi=u·2π, theta=(1−uv.y)·π (see its source) —
+   lets us convert a raycast uv to the exact point on the (spinning) mesh. */
+function uvToLocal(rec, u, v, out){
+  const phi=u*Math.PI*2, theta=(1-v)*Math.PI, st=Math.sin(theta);
+  return out.set(-Math.cos(phi)*st, Math.cos(theta), Math.sin(phi)*st).multiplyScalar(rec.radius);
+}
+function uvToWorld(rec, u, v){ return rec.mesh.localToWorld(uvToLocal(rec,u,v,new THREE.Vector3())); }
+
+/* ---- persistent scars: two canvas-textured overlay spheres per body (lazy).
+   Children of rec.mesh, so they inherit spin and the per-frame size scaling
+   (same pattern as the atmospheres). char = permanent dark marks; glow =
+   additive heat that cools via destination-out fades. ---- */
+function getScars(rec){
+  if(rec.scar) return rec.scar;
+  // texture uploads are the mobile bottleneck: every needsUpdate re-sends the
+  // whole canvas to the GPU. Half resolution on touch devices = 4× cheaper.
+  const SW=MOBILE_UI?512:1024, SH=SW/2, SEG=MOBILE_UI?48:64, SEGH=MOBILE_UI?32:48;
+  const charC=newCanvas(SW,SH), glowC=newCanvas(SW,SH), meltC=newCanvas(SW,SH);
+  const charT=new THREE.CanvasTexture(charC), glowT=new THREE.CanvasTexture(glowC), meltT=new THREE.CanvasTexture(meltC);
+  const mC=new THREE.Mesh(new THREE.SphereGeometry(rec.radius*1.004,SEG,SEGH),
+    new THREE.MeshBasicMaterial({map:charT,transparent:true,depthWrite:false}));
+  const mM=new THREE.Mesh(new THREE.SphereGeometry(rec.radius*1.006,SEG,SEGH),
+    new THREE.MeshBasicMaterial({map:meltT,transparent:true,depthWrite:false}));
+  const mG=new THREE.Mesh(new THREE.SphereGeometry(rec.radius*1.008,SEG,SEGH),
+    new THREE.MeshBasicMaterial({map:glowT,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending}));
+  mC.renderOrder=1; mM.renderOrder=2; mG.renderOrder=4;
+  rec.mesh.add(mC); rec.mesh.add(mM); rec.mesh.add(mG);
+  rec.scar={charC,glowC,meltC,charT,glowT,meltT,mC,mM,mG,coolT:0,hot:0,ocean:null,oceanM:0,log:[],dirty:false,upT:0,meltArea:0};
+  rec.dmgJ=rec.dmgJ||0;
+  impScarred.push(rec);
+  // Android canvas wipe: replay the permanent marks (char + melt) from the log
+  regCanvasTex(charT, function(){
+    const s=rec.scar;
+    s.charC.getContext('2d').clearRect(0,0,s.charC.width,s.charC.height);
+    s.meltC.getContext('2d').clearRect(0,0,s.meltC.width,s.meltC.height);
+    s.glowC.getContext('2d').clearRect(0,0,s.glowC.width,s.glowC.height);   // transient heat: just cleared
+    for(const L of s.log){
+      const ctx=(L.l==='m'?s.meltC:s.charC).getContext('2d');
+      if(L.a!=null){ ctx.save(); ctx.globalAlpha=L.a; impSplat(ctx,L.u,L.v,L.r,L.s); ctx.restore(); }
+      else impSplat(ctx,L.u,L.v,L.r,L.s);
+    }
+    s.meltT.needsUpdate=true; s.glowT.needsUpdate=true;
+  });
+  return rec.scar;
+}
+function scarLog(s, l, u, v, r, style, a){
+  s.log.push({l,u,v,r,s:style,a});
+  if(s.log.length>2600) s.log.splice(0,600);            // cap: long laser burns
+}
+/* accumulate how much of the surface has been painted molten (laser + big
+   impacts), so the hover tier can say "melting" rather than "cratered" when a
+   world's whole-body melt budget is astronomically large but the beam has
+   visibly melted the surface. degR = molten splat radius in degrees;
+   normalized so a 60° cap ≈ a hemisphere ≈ weight 1. */
+function addMeltArea(s, degR){ if(s){ const w=degR/60; s.meltArea=Math.min(1.5,(s.meltArea||0)+w*w); } }
+
+/* ---- melting tiers, from the real energy budget. Heating rock to ~1700 K
+   plus the latent heat of fusion costs ~1.7 MJ/kg (ice much less), so melting
+   a WHOLE world costs mass·that — for an Earth-like planet only a few percent
+   of its binding energy (global magma oceans come long before breakup), while
+   a small moon costs MORE to melt than to shatter, so it cracks apart still
+   cold. Per strike, ~25% of the kinetic energy ends up as impact melt:
+   V = 0.25·E/(ρ·e_melt) — a lava sea painted at its true size. ---- */
+const IMP_MELT_EJKG={icemoon:9e5, iceworld:9e5, ocean:1.2e6};   // J/kg to heat + melt; rock default
+function impMeltEJkg(rec){
+  const c=rec.data.comp;                                     // composition-weighted, when known
+  if(c) return Math.max(4e5, 1.7e6*((c.rock||0)+(c.iron||0)) + 2.8e6*(c.water||0) + 1.0e6*(c.gas||0));
+  return IMP_MELT_EJKG[rec.data.kind]||1.7e6;
+}
+function impMeltJ(rec){ return impBodyMassKg(rec)*impMeltEJkg(rec); }   // melt the whole body
+/* ---- water-rich worlds melt in PHASES, each with its real energy cost:
+   thaw the ice (~0.7 MJ/kg: heat from ~100 K + latent heat of fusion) →
+   liquid oceans; keep pumping (~2.7 MJ/kg: heat to 373 K + vaporization) →
+   the oceans boil into a global steam atmosphere; only then does the rock
+   underneath melt (~1.7 MJ/kg) into the familiar magma ocean. ---- */
+function impWaterFrac(rec){
+  const c=rec.data.comp; if(c) return c.water||0;
+  return {icemoon:0.4, iceworld:0.4, ocean:0.5}[rec.data.kind]||0;
+}
+// worlds whose water is already LIQUID at the surface (Earth-likes, ocean worlds):
+// they skip the thaw phase and boil directly, and their base texture already shows water
+function impLiquidSurface(rec){ const k=rec.data.kind; return k==='ocean'||k==='terran'; }
+// how THICK the boiled steam / thawed water should look: surface-ocean worlds
+// (Earth) get a full shroud; everything else scales by bulk water fraction, so a
+// world with only a trace of subsurface ice (Mars, 1%) gets a faint veil, not a flood.
+function impWaterVis(rec){
+  if(impLiquidSurface(rec)) return 1;
+  return Math.min(1, impWaterFrac(rec)/0.12);
+}
+function impMeltPhases(rec){
+  const M=impBodyMassKg0(rec), W=impWaterFrac(rec);
+  const E3=M*impMeltEJkg(rec);
+  let E1=impLiquidSurface(rec)?0:M*W*7e5;        // liquid-surface worlds start already liquid (no thaw)
+  let E2=E1+M*W*2.7e6;
+  E2=Math.min(E2,E3*0.92); E1=Math.min(E1,E2*0.7);
+  return {W,E1,E2,E3};
+}
+function impMeltPoolDeg(rec,E){              // angular radius of the lava sea one strike leaves
+  const rho=impBodyRho(rec);
+  const V=0.25*E/(rho*impMeltEJkg(rec));                        // m³ of melt
+  const r=Math.cbrt(V*3/(2*Math.PI));                           // hemispherical pool
+  return Math.min(80, r/((rec.data.radiusKm||1000)*1000)*57.2958);
+}
+function impCraterDeg(rec,E){                // gravity-regime π-scaling D ∝ E^0.28, anchored at Chicxulub (180 km)
+  const Dkm=180*Math.pow(E/IMP_CHICXULUB_J,0.28);
+  return Math.min(80, Dkm*0.5/(rec.data.radiusKm||1000)*57.2958);
+}
+function getMagmaOcean(rec){                 // lazy: a self-luminous molten-surface shell
+  const s=getScars(rec);
+  if(s.ocean) return s.ocean;
+  const seed=(rec.data.key||'x').split('').reduce((a,ch)=>a*31+ch.charCodeAt(0),7)>>>0;
+  const genO=()=>texRocky({b:'#1c0803', base:'#4a1206', a:'#8a2408', c:'#d4501a'},
+    (seed^0x9e37)>>>0, {glow:'#ffc24e', w:MOBILE_UI?512:1024, h:MOBILE_UI?256:512});
+  const cv=genO();
+  const t=new THREE.CanvasTexture(cv);
+  t.anisotropy=4; t.wrapS=THREE.RepeatWrapping;                 // wraps → the magma can churn
+  regCanvasTex(t, function(){ cv.getContext('2d').drawImage(genO(),0,0); });  // Android canvas wipe
+  const m=new THREE.Mesh(new THREE.SphereGeometry(rec.radius*1.007,MOBILE_UI?48:64,MOBILE_UI?32:48),
+    new THREE.MeshBasicMaterial({map:t, transparent:true, opacity:0, depthWrite:false}));
+  m.renderOrder=3;
+  rec.mesh.add(m);
+  s.ocean=m;
+  return m;
+}
+function getWaterOcean(rec){                 // thawed ice: a liquid-water shell
+  const s=getScars(rec);
+  if(s.wocean) return s.wocean;
+  const seed=((rec.data.key||'x').split('').reduce((a,ch)=>a*31+ch.charCodeAt(0),7)^0x51f7)>>>0;
+  // coverage is BAKED per body: a water-rich world floods globally, a trace-water
+  // world (Mars, 1%) only pools in polar basins → polar lakes, not a global flood
+  const cov=impWaterVis(rec);
+  const SW2=MOBILE_UI?512:1024, SH2=MOBILE_UI?256:512;
+  const cv=newCanvas(SW2,SH2);
+  const paint=()=>{
+    const ctx=cv.getContext('2d');
+    const img=ctx.createImageData(SW2,SH2), d=img.data;
+    const fbm=makeNoise3(seed);
+    for(let y=0;y<SH2;y++){ const v=y/SH2, lat=Math.abs(v-0.5)*2;
+      const polar=smooth(0.5,0.92,lat);                    // cold traps: water collects at the poles
+      for(let x=0;x<SW2;x++){ const u=x/SW2, ang=u*Math.PI*2;
+        const basin=ring(fbm,ang,v,8,7,5,0)*0.5+0.5;       // 0..1, low = deep basin
+        const ripple=ring(fbm,ang,v,26,22,3,60)*0.5+0.5;
+        const aff=(1-basin)*0.5 + polar*0.8;               // affinity for water: basins + poles
+        const a=smooth((1-cov)-0.12,(1-cov)+0.12, aff);    // wet where affinity beats the fill level
+        const t2=Math.max(0,Math.min(1, ripple*0.7 + basin*0.3));
+        const o=(y*SW2+x)*4;
+        d[o]  = Math.round(10 + 60*t2);                    // deep navy → lighter blue highlights
+        d[o+1]= Math.round(50 + 100*t2);
+        d[o+2]= Math.round(110 + 100*t2);
+        d[o+3]= Math.round(a*255);
+      }
+    }
+    ctx.putImageData(img,0,0);
+  };
+  paint();
+  const t=new THREE.CanvasTexture(cv);
+  t.anisotropy=4; t.wrapS=THREE.RepeatWrapping;
+  regCanvasTex(t,paint);
+  const m=new THREE.Mesh(new THREE.SphereGeometry(rec.radius*1.0068,MOBILE_UI?48:64,MOBILE_UI?32:48),
+    new THREE.MeshBasicMaterial({map:t, transparent:true, opacity:0, depthWrite:false}));
+  m.renderOrder=3;
+  rec.mesh.add(m);
+  s.wocean=m;
+  return m;
+}
+function getSteamShroud(rec){                // boiled-off oceans: a global white cloud deck
+  const s=getScars(rec);
+  if(s.steam) return s.steam;
+  const seed=((rec.data.key||'x').split('').reduce((a,ch)=>a*31+ch.charCodeAt(0),7)^0xbead)>>>0;
+  const SW2=MOBILE_UI?512:1024, SH2=MOBILE_UI?256:512;
+  const cv=newCanvas(SW2,SH2);
+  const paint=()=>{
+    const ctx=cv.getContext('2d');
+    const img=ctx.createImageData(SW2,SH2), d=img.data;
+    const fbm=makeNoise3(seed);
+    for(let y=0;y<SH2;y++){ const v=y/SH2;
+      for(let x=0;x<SW2;x++){ const u=x/SW2, ang=u*Math.PI*2;
+        const n =ring(fbm,ang,v,7,6,5,0)*0.5+0.5;
+        const n2=ring(fbm,ang,v,18,14,4,40)*0.5+0.5;
+        // denser than a thin cloud deck: a boiled-ocean world should read as
+        // solidly steam-shrouded (per-body opacity via wvis still thins Mars etc.)
+        const a=Math.max(0,Math.min(1,(n*0.6+n2*0.4-0.04)*1.85));
+        const o=(y*SW2+x)*4;
+        d[o]=234; d[o+1]=239; d[o+2]=244; d[o+3]=a*255;
+      }
+    }
+    ctx.putImageData(img,0,0);
+  };
+  paint();
+  const t=new THREE.CanvasTexture(cv);
+  t.wrapS=THREE.RepeatWrapping;
+  regCanvasTex(t,paint);
+  const m=new THREE.Mesh(new THREE.SphereGeometry(rec.radius*1.012,MOBILE_UI?48:64,MOBILE_UI?32:48),
+    new THREE.MeshBasicMaterial({map:t, transparent:true, opacity:0, depthWrite:false}));
+  m.renderOrder=6;
+  rec.mesh.add(m);
+  s.steam=m;
+  return m;
+}
+function getSteamHalo(rec){                  // pale limb glow of a steam envelope
+  const s=getScars(rec);
+  if(s.steamHalo) return s.steamHalo;
+  s.steamHalo=makeAtmosphere(rec.radius*1.06, 0xdfe9f2, 0);
+  s.steamHalo.renderOrder=5;
+  rec.mesh.add(s.steamHalo);
+  return s.steamHalo;
+}
+function getMagmaHalo(rec){                  // molten-limb glow (fresnel rim, like the atmospheres)
+  const s=getScars(rec);
+  if(s.halo) return s.halo;
+  s.halo=makeAtmosphere(rec.radius*1.05, 0xff6a22, 0);
+  s.halo.renderOrder=5;
+  rec.mesh.add(s.halo);
+  return s.halo;
+}
+/* ---- gas/ice giants have no surface to melt: pumping energy into the
+   envelope makes it PUFF UP like an inflated hot Jupiter — the radius swells,
+   the envelope glows from the heat, and gas streams away in an escaping tail.
+   At the binding energy it still comes apart completely. ---- */
+function impUpdatePuff(rec){
+  const f=Math.min(1,(rec.dmgJ||0)/impBindingJ(rec));
+  rec.puffTarget=1+0.55*Math.pow(f,0.7);                    // up to +55% radius near breakup
+  const m=rec.mesh.material;
+  if(m && m.emissive){
+    if(!rec._baseEmissive) rec._baseEmissive={c:m.emissive.clone(), i:m.emissiveIntensity||0};
+    m.emissive.copy(rec._baseEmissive.c).lerp(new THREE.Color(0xff7733), Math.min(1,f*1.6));
+    m.emissiveIntensity=rec._baseEmissive.i+1.3*f;          // heated envelope glows
+  }
+  if(f>0.05) impBoostTail(rec,f);                           // envelope starts streaming away
+}
+function impBoostTail(rec,f){                               // escaping-material tail (mass loss made visible)
+  let t=rec._puffTail || evapTails.find(x=>x.rec===rec);    // Amunet already trails one — boost it
+  if(!t){ t=makeEvapTail(rec,{alpha:0.3,rate:1}); t._created=true; t.points.visible=showTails; }
+  if(!t._base) t._base={rate:t.rate, alpha:t.points.material.uniforms.uAlpha.value};
+  t.rate=t._base.rate*(1+3.5*f);
+  t.points.material.uniforms.uAlpha.value=Math.max(t._base.alpha, 0.3+1.1*f);
+  rec._puffTail=t;
+}
+function impUpdateMelt(rec){                 // cumulative surface state from the phase budgets
+  if(!rec.scar || impImmune(rec)) return;
+  if(rec.data.kind==='gasgiant'){ impUpdatePuff(rec); return; }
+  const s=rec.scar;
+  const E=rec.dmgJ||0;
+  const fU=E/impBindingJ(rec);
+  const P=impMeltPhases(rec);
+  const watery=P.W>0;                        // any water boils first (Earth's oceans are tiny in mass but real)
+  // phase progress 0..1: thaw → boil → melt the rock
+  const ph1 = watery&&P.E1>0 ? Math.min(1,E/P.E1) : 1;
+  const ph2 = watery ? Math.max(0,Math.min(1,(E-P.E1)/(P.E2-P.E1))) : 1;
+  const ph3 = Math.max(0,Math.min(1,(E-P.E2)/(P.E3-P.E2)));
+  // rock-melt coverage (same shaping as before, over the post-steam budget)
+  const m = ph3<=0.02 ? 0 : Math.min(1, Math.pow((ph3-0.02)/0.98, 0.6));
+  // superheat: past the full budget — or nearing breakup — it runs white-hot
+  const hot = Math.min(1, Math.max(ph3>1-1e-9?( E/P.E3-1)/2:0, fU>0.25?(fU-0.25)/0.75:0));
+  // wvis scales how much water/steam actually SHOWS — a trace-water world (Mars)
+  // gets a faint veil, an ocean world a full shroud
+  const wvis = impWaterVis(rec);
+  // liquid water: appears as the ice thaws, drowned out as the rock melts,
+  // and boiled AWAY as the steam phase completes. Spatial coverage (global ocean
+  // vs. polar lakes) is baked into the getWaterOcean texture per water abundance,
+  // so opacity here is just the thaw-phase fade — no wvis factor (would double-thin)
+  const wat = (watery && !impLiquidSurface(rec))      // liquid-surface worlds already show their water
+    ? Math.min(1,Math.pow(ph1,0.7))*(1-ph2)*(1-m) : 0;
+  // steam shroud: builds while the oceans boil, then thins away as the rock melts
+  // through it (magma coverage m) and as the world superheats — so the glowing
+  // surface shows instead of a permanent white ball
+  const stm = watery ? Math.min(1,Math.pow(ph2,0.8))*(1-0.85*hot)*Math.max(0,1-1.1*m)*wvis : 0;
+  s.oceanM=m; s.oceanHot=hot; s.waterM=wat; s.steamM=stm; s.ph={ph1,ph2,ph3};
+  // superheated crust boils off as rock vapor — the mass actually leaves (impMassLostKg);
+  // a boiling water world sheds its steam the same way (impMassLostKg counts water first)
+  if(hot>0.05) impBoostTail(rec, 0.4*hot);
+  else if(watery && ph2>0.15 && ph2<1) impBoostTail(rec, 0.25*ph2*wvis);
+  if(wat>0.01) getWaterOcean(rec).material.opacity=Math.min(1,wat);
+  else if(s.wocean) s.wocean.material.opacity=0;
+  if(stm>0.01){
+    getSteamShroud(rec).material.opacity=Math.min(1,stm*1.25);   // full steam = solidly covers the surface
+    getSteamHalo(rec).material.uniforms.p.value=1.2*stm*(1-hot);
+  } else {
+    if(s.steam) s.steam.material.opacity=0;
+    if(s.steamHalo) s.steamHalo.material.uniforms.p.value=0;
+  }
+  if(m<=0 && hot<=0){ if(s.ocean) s.ocean.material.opacity=0;
+    if(s.halo) s.halo.material.uniforms.p.value=0; return; }
+  const o=getMagmaOcean(rec);
+  o.material.opacity=Math.min(1, m*(1+0.3*hot));
+  o.material.color.setScalar(1+0.25*m+2.6*hot);                 // overdriven = white-hot under ACES
+  getMagmaHalo(rec).material.uniforms.p.value=1.6*(0.35*m+0.9*hot);
+}
+function impTierTxt(rec){                    // hover readout of the surface state (+ mass boiled off)
+  const base=impTierBase(rec);
+  if(!base) return base;
+  const lf=impMassLostKg(rec)/impBodyMassKg0(rec);
+  if(lf>0.001) return base+T('tier-massloss').replace('{p}', lf<0.10?(lf*100).toFixed(1):String(Math.round(lf*100)));
+  return base;
+}
+function impTierBase(rec){
+  if(!(rec.dmgJ>0)) return '';
+  if(rec.data.kind==='gasgiant'){            // no surface — the envelope inflates instead
+    const f=rec.dmgJ/impBindingJ(rec);
+    if(f>0.5)  return T('tier-puff-3');
+    if(f>0.15) return T('tier-puff-2');
+    if(f>0.01) return T('tier-puff-1');
+    return '';
+  }
+  const E=rec.dmgJ, fU=E/impBindingJ(rec), P=impMeltPhases(rec);
+  // a big icy/rocky world's whole-body melt budget is astronomical, so the global
+  // melt fraction stays ~0 even when the beam has visibly melted the surface —
+  // fold in locally-painted molten coverage so the label tracks what's rendered
+  const mcov = rec.scar ? Math.min(1, rec.scar.meltArea||0) : 0;
+  if(fU>0.5)  return T('tier-white');
+  if(E>=P.E3) return T('tier-molten');
+  const ph3=Math.max(0,(E-P.E2)/(P.E3-P.E2));
+  const surf=Math.max(ph3, mcov);            // global magma progress OR locally-melted surface
+  if(surf>0.3)  return T('tier-ocean').replace('{p}',Math.round(surf*100));
+  if(surf>0.03) return T('tier-regional').replace('{p}',Math.round(surf*100));
+  if(P.W>0 && ph3<=0.02){                     // water worlds: (thaw →) boil, unless already melting
+    const ph2=(E-P.E1)/(P.E2-P.E1);
+    if(ph2>0.02) return T('tier-steam').replace('{p}',Math.round(Math.min(1,ph2)*100));
+    if(!impLiquidSurface(rec) && E>0.05*P.E1){ const ph1=E/P.E1;
+      // a trace-water world only pools POLAR lakes — say so, so a player knows where to look
+      const key=impWaterVis(rec)<0.5?'tier-thaw-polar':'tier-thaw';
+      return T(key).replace('{p}',Math.round(Math.min(1,ph1)*100)); }
+  }
+  const mf=E/impMeltJ(rec);
+  if(surf>0.004 || mf>1e-4) return T('tier-seas');
+  return T('tier-crater');
+}
+const IMP_CHAR=[[0,'rgba(10,6,5,0.88)'],[0.5,'rgba(14,9,7,0.60)'],[0.8,'rgba(22,13,9,0.28)'],[1,'rgba(22,13,9,0)']];
+const IMP_CHAR_SOFT=[[0,'rgba(10,6,5,0.16)'],[0.7,'rgba(14,9,7,0.08)'],[1,'rgba(14,9,7,0)']];
+const IMP_GLOW=[[0,'rgba(255,244,214,0.95)'],[0.3,'rgba(255,150,60,0.75)'],[0.7,'rgba(190,45,12,0.35)'],[1,'rgba(190,45,12,0)']];
+const IMP_GLOW_SOFT=[[0,'rgba(255,220,150,0.50)'],[0.6,'rgba(255,120,45,0.22)'],[1,'rgba(255,120,45,0)']];
+const IMP_LAVA=[[0,'rgba(255,238,180,0.95)'],[0.25,'rgba(255,160,60,0.90)'],[0.55,'rgba(205,58,14,0.72)'],[0.8,'rgba(120,26,10,0.35)'],[1,'rgba(120,26,10,0)']];
+const IMP_LAVA_SOFT=[[0,'rgba(255,190,90,0.55)'],[0.5,'rgba(200,60,16,0.30)'],[1,'rgba(200,60,16,0)']];
+/* splat at canvas-space (u,v): longitude-stretched near the poles, drawn
+   thrice (u−1,u,u+1) so it wraps the 0°/360° seam */
+function impSplat(ctx, u, v, rPx, style){
+  // rPx is in 512-canvas-height units; adapt to this canvas (mobile is 256-high)
+  const W=ctx.canvas.width, H=ctx.canvas.height, r=rPx*(H/512);
+  const stretch=1/Math.max(Math.sin(v*Math.PI),0.20), rx=r*stretch;
+  for(const du of [-1,0,1]){
+    const cx=(u+du)*W, cy=v*H;
+    if(cx+rx<0||cx-rx>W) continue;
+    ctx.save(); ctx.translate(cx,cy); ctx.scale(rx/r,1);
+    const g=ctx.createRadialGradient(0,0,0,0,0,r);
+    for(const s of style) g.addColorStop(s[0],s[1]);
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function impFlashTexture(){ if(!_impFlashTex) _impFlashTex=glowCanvasTex('rgba(255,250,232,1)','rgba(255,160,60,0.55)');
+  return _impFlashTex; }
+function impRingTexture(){
+  if(_impRingTex) return _impRingTex;
+  const s=256, c=newCanvas(s,s), ctx=c.getContext('2d');
+  const g=ctx.createRadialGradient(s/2,s/2,s*0.30,s/2,s/2,s*0.5);
+  g.addColorStop(0,'rgba(255,190,110,0)'); g.addColorStop(0.75,'rgba(255,205,140,0.85)');
+  g.addColorStop(1,'rgba(255,140,60,0)');
+  ctx.fillStyle=g; ctx.fillRect(0,0,s,s);
+  _impRingTex=new THREE.CanvasTexture(c); return _impRingTex;
+}
+function spawnFlash(wp, R, E){
+  const sc=R*(0.9+0.6*Math.min(4, Math.max(0,Math.log10(Math.max(1,E/IMP_CHICXULUB_J)))+1));
+  const sp=acquireFxSprite(_flashPool, impFlashTexture());
+  sp.position.copy(wp);
+  impFx.push({o:sp,t:0,T:0.7,kind:'flash',sc,pool:_flashPool});
+}
+function spawnShock(wp, R, E){
+  const sc=R*(1.1+0.5*Math.min(4, Math.max(0,Math.log10(Math.max(1,E/IMP_CHICXULUB_J)))+1));
+  const sp=acquireFxSprite(_shockPool, impRingTexture());
+  sp.position.copy(wp);
+  impFx.push({o:sp,t:0,T:1.2,kind:'shock',sc,pool:_shockPool});
+}
+
+/* ---- shared ejecta/spark pool: one Points draw, evap-tail-style shader ---- */
+function getImpPool(){
+  if(impPool) return impPool;
+  const N=2048;
+  const pos=new Float32Array(N*3), ageA=new Float32Array(N).fill(1), sizeA=new Float32Array(N), seed=new Float32Array(N);
+  for(let i=0;i<N;i++) seed[i]=Math.random();
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(pos,3).setUsage(THREE.DynamicDrawUsage));
+  g.setAttribute('aAge',new THREE.BufferAttribute(ageA,1).setUsage(THREE.DynamicDrawUsage));
+  g.setAttribute('aSize',new THREE.BufferAttribute(sizeA,1).setUsage(THREE.DynamicDrawUsage));
+  g.setAttribute('aSeed',new THREE.BufferAttribute(seed,1));
+  const m=new THREE.ShaderMaterial({
+    uniforms:{uScaleH:{value:600}},
+    vertexShader:
+      'attribute float aAge; attribute float aSize; attribute float aSeed;\n'+
+      'varying float vAge; varying float vSeed; uniform float uScaleH;\n'+
+      'void main(){ vAge=aAge; vSeed=aSeed;\n'+
+      '  vec4 mv=modelViewMatrix*vec4(position,1.0);\n'+
+      '  gl_PointSize=clamp(aSize*(1.0+2.2*aAge)*uScaleH/max(0.0001,-mv.z),1.0,90.0);\n'+
+      '  gl_Position=projectionMatrix*mv; }',
+    fragmentShader:
+      'varying float vAge; varying float vSeed;\n'+
+      'void main(){ if(vAge>=1.0) discard;\n'+
+      '  float r=length(gl_PointCoord-0.5)*2.0; float d=exp(-4.0*r*r);\n'+
+      '  vec3 col = vAge<0.3 ? mix(vec3(1.0,0.97,0.88),vec3(1.0,0.55,0.2),vAge/0.3)\n'+
+      '                      : mix(vec3(1.0,0.55,0.2),vec3(0.25,0.12,0.08),(vAge-0.3)/0.7);\n'+
+      '  float a=d*(1.0-vAge)*(0.5+0.3*vSeed);\n'+
+      '  gl_FragColor=vec4(col,a); }',
+    transparent:true, depthWrite:false, blending:THREE.AdditiveBlending});
+  const points=new THREE.Points(g,m); points.frustumCulled=false; scene.add(points);
+  impPool={N,g,pos,ageA,sizeA,vel:new Float32Array(N*3),
+    age:new Float32Array(N).fill(9),life:new Float32Array(N).fill(1),head:0,points,m};
+  return impPool;
+}
+function emitBurst(wp, n, dirFn, speed, sizeBase, life){
+  const P=getImpPool();
+  for(let k=0;k<n;k++){
+    const i=P.head; P.head=(P.head+1)%P.N;
+    const d=dirFn(), s=speed*(0.4+Math.random());
+    P.pos[i*3]=wp.x; P.pos[i*3+1]=wp.y; P.pos[i*3+2]=wp.z;
+    P.vel[i*3]=d.x*s; P.vel[i*3+1]=d.y*s; P.vel[i*3+2]=d.z*s;
+    P.age[i]=0; P.life[i]=life*(0.6+0.8*Math.random());
+    P.sizeA[i]=sizeBase*(0.6+0.8*Math.random());
+  }
+  impPoolActiveT=Math.max(impPoolActiveT, life*1.6);
+}
+function impConeDir(normal, spread){
+  return function(){
+    return _impV3.set(Math.random()*2-1,Math.random()*2-1,Math.random()*2-1)
+      .normalize().multiplyScalar(spread).add(normal).normalize().clone();
+  };
+}
+
+/* ---- the strike itself: flash + shockwave + ejecta + painted crater + damage.
+   imp (optional, asteroids): {mKg, vKms, dir} — the momentum kick that nudges the orbit ---- */
+function applyStrike(rec, u, v, E, imp){
+  const wp=uvToWorld(rec,u,v);
+  const R=rec.radius*rec.mesh.scale.x;
+  const normal=_impV1.copy(wp).sub(worldPosOf(rec)).normalize().clone();
+  const fxP=wp.clone().addScaledVector(normal,R*0.04);
+  const thM=impMeltPoolDeg(rec,E);           // lava sea, at its physical size on this world
+  sfxImpact(rec,E);
+  const meltish=Math.min(1, thM/12);         // 0 = cratering strike, 1 = region-melting monster
+  spawnFlash(fxP,R*(1+1.2*meltish),E); spawnShock(fxP,R*(1+0.8*meltish),E);
+  if(!impImmune(rec) && !rec.destroyed){
+    emitBurst(fxP, Math.min(700, 120+Math.round(60*Math.log10(Math.max(1,E/1e21)))),
+      impConeDir(normal,0.75), R*(1.1+0.8*meltish), R*0.11, 1.9+1.1*meltish);
+    const s=getScars(rec);
+    const U=impBindingJ(rec);
+    const th=Math.max(0.8, impCraterDeg(rec,E), thM*1.15);      // char rim just beyond the melt
+    const rPx=th/180*512;
+    const gasy=(rec.data.kind==='gasgiant');
+    if(!gasy){ impSplat(s.charC.getContext('2d'), u, 1-v, rPx, IMP_CHAR);
+      scarLog(s,'c',u,1-v,rPx,IMP_CHAR,null); }
+    if(!gasy && thM>0.25){                   // big hits leave a permanent lava sea, not just char
+      const mc=s.meltC.getContext('2d');
+      mc.save(); mc.globalAlpha=0.45+0.55*meltish;
+      impSplat(mc, u, 1-v, thM/180*512, IMP_LAVA);
+      mc.restore(); s.meltT.needsUpdate=true;
+      scarLog(s,'m',u,1-v,thM/180*512,IMP_LAVA,0.45+0.55*meltish);
+      addMeltArea(s, thM);                    // this hit melted ~thM° of surface
+    }
+    impSplat(s.glowC.getContext('2d'), u, 1-v, rPx*(gasy?1.7:1.15+0.9*meltish), IMP_GLOW);
+    s.charT.needsUpdate=true; s.glowT.needsUpdate=true;
+    s.hot=Math.max(s.hot, 7+45*meltish);     // molten regions stay incandescent much longer
+    rec.dmgJ=(rec.dmgJ||0)+E;
+    rec._lastHit={u,v};                      // the killing blow shapes how the world breaks apart
+    impUpdateMelt(rec);                      // craters → melt seas → global magma ocean
+    if(rec.dmgJ>=U && !rec.shattered) shatterBody(rec);
+    // momentum: the asteroid's m·v kicks the orbit — recomputed exactly
+    if(imp && imp.mKg && !rec.destroyed){
+      const dvKms=imp.mKg*imp.vKms/impBodyMassKg(rec);
+      if(perturbOrbit(rec, imp.dir, dvKms) && APP.currentData && APP.currentData.key===rec.data.key &&
+         document.getElementById('info').classList.contains('open')) openInfo(rec.data);
+    }
+  }
+  const dist=camera.position.distanceTo(wp);
+  const ref=camera.position.distanceTo(controls.target)+1e-6;
+  impShake=Math.min(0.06, impShake+(0.008*Math.max(0,Math.log10(Math.max(1,E/IMP_CHICXULUB_J))+1)+0.02*meltish)*Math.max(0,1-dist/(ref*4)));
+}
+
+/* crust shattered: the world actually comes apart. The planet mesh is hidden
+   and replaced (in place, still on its orbit) by a debris field — tumbling
+   rock chunks drifting apart plus a hot dust haze that expands and fades.
+   The info panel switches to "A debris field." until 🧽 Heal resurrects it. */
+const debrisFields=[];
+function shatterBody(rec){
+  rec.shattered=true; rec.destroyed=true;
+  sfxShatter(rec);
+  const wp=worldPosOf(rec), R=rec.radius*rec.mesh.scale.x;
+  spawnFlash(wp,R*2.6,impBindingJ(rec));
+  spawnShock(wp,R*2.0,impBindingJ(rec));
+  emitBurst(wp, 800, function(){ return _impV3.set(Math.random()*2-1,Math.random()*2-1,Math.random()*2-1).normalize().clone(); },
+    R*1.8, R*0.15, 2.8);
+  // hide the world + everything stuck to it (atmosphere, scar overlays)
+  for(const ch of rec.mesh.children) ch.visible=false;
+  rec.mesh.material.visible=false;      // mesh object stays: keeps orbiting, pickable, scalable
+  makeDebrisField(rec);
+  makeDebrisRing(rec);                  // Kepler shear smears it into a ring along the old orbit
+  liberateMoons(rec);                   // its moons sail on around Ra on their own new orbits
+  updateNavStatus(rec);                 // sidebar: red ☠ destroyed badge
+  const el=labelEls[rec.data.key]; if(el) el.textContent=locName(rec.data)+' ☠';
+  if(APP.currentData && APP.currentData.key===rec.data.key &&
+     document.getElementById('info').classList.contains('open')) openInfo(rec.data);
+  impShake=Math.min(0.06, impShake+0.03);
+}
+
+/* ---- crustal shard: a curved cap of the planet's sphere with radial depth.
+   Outer face keeps the planet's OWN texture (equirect UVs around the cap
+   centre, unwrapped across the 0/1 seam); inner faces are ember rock.
+   Built in a +Y-up local frame, oriented to `dir`, re-centred on its own
+   centroid so tumbling spins the piece about itself. Returns {geo,center}. */
+function makeShardGeo(dir, angR, k, depth, R){
+  const pos=[], uv=[];
+  const up=new THREE.Vector3(0,1,0);
+  const q=new THREE.Quaternion().setFromUnitVectors(up, dir.clone().normalize());
+  const ringO=[], ringM=[], ringI=[], uvO=[], uvM=[];
+  const thJ=[];
+  for(let j=0;j<k;j++) thJ.push(angR*(0.8+0.4*Math.random()));
+  const cV=new THREE.Vector3(0,1,0).applyQuaternion(q);
+  const uvOf=(d,u0)=>{                       // Three's sphere mapping, seam-unwrapped near u0
+    const vt=1-Math.acos(Math.max(-1,Math.min(1,d.y)))/Math.PI;
+    let ut=Math.atan2(d.z,-d.x)/(2*Math.PI); if(ut<0) ut+=1;
+    if(u0!=null){ while(ut-u0>0.5) ut-=1; while(u0-ut>0.5) ut+=1; }
+    return [ut,vt];
+  };
+  const cUV=uvOf(cV,null);
+  for(let j=0;j<k;j++){
+    const ps=j/k*Math.PI*2 + (Math.random()-0.5)*0.5/k*Math.PI;
+    const th=thJ[j], sm=Math.sin(th*0.55), so=Math.sin(th);
+    ringM.push(new THREE.Vector3(sm*Math.cos(ps),Math.cos(th*0.55),sm*Math.sin(ps)).applyQuaternion(q));
+    ringO.push(new THREE.Vector3(so*Math.cos(ps),Math.cos(th),so*Math.sin(ps)).applyQuaternion(q));
+    ringI.push(ringO[j].clone().multiplyScalar(1-depth*(0.8+0.4*Math.random())));
+    uvM.push(uvOf(ringM[j],cUV[0])); uvO.push(uvOf(ringO[j],cUV[0]));
+  }
+  const cI=cV.clone().multiplyScalar(1-depth);
+  const push=(p,t)=>{ pos.push(p.x*R,p.y*R,p.z*R); uv.push(t[0],t[1]); };
+  // outer cap (two rings, keeps the sphere's curve): material group 0
+  for(let j=0;j<k;j++){ const n=(j+1)%k;
+    push(cV,cUV);      push(ringM[n],uvM[n]); push(ringM[j],uvM[j]);
+    push(ringM[j],uvM[j]); push(ringM[n],uvM[n]); push(ringO[j],uvO[j]);
+    push(ringO[j],uvO[j]); push(ringM[n],uvM[n]); push(ringO[n],uvO[n]);
+  }
+  const outerCount=pos.length/3;
+  // inner fan + side walls: material group 1 (rock), throwaway UVs
+  const rockUV=(p)=>[p.x*0.5+0.5, p.z*0.5+0.5];
+  for(let j=0;j<k;j++){ const n=(j+1)%k;
+    push(cI,rockUV(cI));        push(ringI[j],rockUV(ringI[j])); push(ringI[n],rockUV(ringI[n]));
+    push(ringO[j],rockUV(ringO[j])); push(ringI[n],rockUV(ringI[n])); push(ringI[j],rockUV(ringI[j]));
+    push(ringO[j],rockUV(ringO[j])); push(ringO[n],rockUV(ringO[n])); push(ringI[n],rockUV(ringI[n]));
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv,2));
+  g.addGroup(0,outerCount,0); g.addGroup(outerCount,pos.length/3-outerCount,1);
+  // re-centre on the centroid so rotation tumbles the shard about itself
+  g.computeBoundingBox();
+  const c=new THREE.Vector3(); g.boundingBox.getCenter(c);
+  g.translate(-c.x,-c.y,-c.z);
+  g.computeVertexNormals();
+  return {geo:g, center:c};
+}
+
+/* Fragments of a world-shattering impact are HOT: dumping a planet's binding
+   energy into it melts and bakes everything. The shard skin is the planet's
+   own map charred nearly black, with molten cracks glowing through it —
+   no surviving oceans or forests. */
+function impScorchedSkin(rec){
+  // 512×256 — shards are small; full res cost a visible hitch on tablets
+  const W=512,H=256, c=newCanvas(W,H), ec=newCanvas(W,H);
+  const seed=(rec.data.key||'x').split('').reduce((a,ch)=>a*31+ch.charCodeAt(0),7)>>>0;
+  const paint=function(){
+    const ctx=c.getContext('2d');
+    let drew=false;
+    const img=rec.mesh.material.map && rec.mesh.material.map.image;
+    if(img){
+      try{                               // probe first: a tainted canvas would break the GL upload
+        const pr=newCanvas(2,2); pr.getContext('2d').drawImage(img,0,0,2,2);
+        pr.getContext('2d').getImageData(0,0,1,1);
+        ctx.drawImage(img,0,0,W,H); drew=true;
+      }catch(_){ drew=false; }
+    }
+    if(!drew){ ctx.fillStyle='#'+new THREE.Color(rec.data.color||0x887766).getHexString(); ctx.fillRect(0,0,W,H); }
+    ctx.fillStyle='rgba(14,9,6,0.78)'; ctx.fillRect(0,0,W,H);      // baked to char
+    const r=texRocky({b:'#140602', base:'#3a0e04', a:'#6a1a06', c:'#a03210'},
+      (seed^0x51f3)>>>0, {glow:'#ffcf5e', emissData:true, w:W, h:H});
+    ec.getContext('2d').drawImage(r.emap,0,0);                     // molten-crack emissive
+  };
+  paint();
+  const map=new THREE.CanvasTexture(c), emap=new THREE.CanvasTexture(ec);
+  regCanvasTex(map, function(){ paint(); emap.needsUpdate=true; });  // Android canvas wipe
+  return {map, emap};
+}
+
+function makeDebrisField(rec){
+  const group=new THREE.Object3D();
+  rec.mesh.add(group);                  // inherits spin + the per-frame dot-floor scaling
+  const R=rec.radius;                   // mesh-local units
+  // composition: 0 = bare rock, 1 = almost all gas — the H/He envelope plus
+  // water flashed to steam, from the .ubox depots (Amunet 0.48, Wadjet 0.27)
+  const gas=impGasFrac(rec);
+  const rockT=impRockTex();
+  // emissiveMap = the rock albedo too: the ember glow follows the fracture
+  // detail instead of flooding the chunks flat orange
+  const chunkMat=rockT
+    ? new THREE.MeshStandardMaterial({map:rockT, roughness:0.95,
+        emissive:0xff6a30, emissiveMap:rockT, emissiveIntensity:1.4})
+    : new THREE.MeshStandardMaterial({color:new THREE.Color(rec.data.color||0x9a8877).multiplyScalar(0.8),
+        roughness:0.95, emissive:0xff6a30, emissiveIntensity:0.6});
+  chunkMat.userData.emberBase = rockT?1.4:0.6;
+  const geos=[];
+  const seedBase=(rec.data.key||'x').split('').reduce((a,ch)=>a*31+ch.charCodeAt(0),7)>>>0;
+  for(let gi=0; gi<3; gi++) geos.push(makeRockGeo(11,8, seedBase+gi*7919));  // three rock shapes, reused
+  const chunks=[];
+
+  /* ---- the breakup is shaped by the killing blow ----
+     hitDir = where the final strike landed; overshoot = how far past the
+     binding energy the bombardment went. Fragments fly away from the hit
+     point: a fast, finely-fragmented cone around it, slow heavy slabs on
+     the far side — barely past U the world falls apart lazily, a massive
+     overkill blasts it. */
+  const hit=rec._lastHit||{u:0.5,v:0.5};
+  const hitDir=uvToLocal(rec, hit.u, hit.v, new THREE.Vector3()).normalize();
+  const over=Math.max(1,(rec.dmgJ||0)/impBindingJ(rec));
+  const ovk=Math.min(3, Math.log10(over)+1);           // 1 @ U … 2 @ 10U … 3 @ 100U
+  const sBase=R*(0.012+0.038*ovk);
+  const velOf=(dirFrom)=>{                              // impact-driven velocity field
+    const cd=dirFrom.dot(hitDir), w=Math.pow(0.5+0.5*cd,1.6);
+    const v=dirFrom.clone().addScaledVector(hitDir,-0.55).normalize()
+      .multiplyScalar(sBase*(0.3+1.5*w+0.3*Math.random()));
+    return v.addScaledVector(new THREE.Vector3(Math.random()-0.5,Math.random()-0.5,Math.random()-0.5), sBase*0.18);
+  };
+
+  // crustal shards — pieces of the planet ITSELF, its surface texture still
+  // on their outer face. Gas-dominated worlds (gas ≥ 0.85, e.g. Amunet) have
+  // no crust to shatter — the fraction, not the kind, decides: Wadjet is
+  // kind 'gasgiant' but mostly rock (debrisGas 0.4) and breaks into slabs.
+  const shardGeos=[]; let outerMat=null;
+  if(gas<0.85){
+    const skin=impScorchedSkin(rec);     // charred crust with molten cracks — not the living surface
+    skin.map.wrapS=THREE.RepeatWrapping; skin.emap.wrapS=THREE.RepeatWrapping;
+    outerMat=new THREE.MeshStandardMaterial({map:skin.map, roughness:1.0,
+      emissive:0xffffff, emissiveMap:skin.emap, emissiveIntensity:2.2});
+    outerMat.userData.emberBase=2.2;
+    const NS=Math.round(30*(1-0.5*gas)*(MOBILE_UI?0.65:1));   // fewer draw calls on tablets
+    const GA=Math.PI*(3-Math.sqrt(5));
+    for(let i=0;i<NS;i++){
+      const y=1-2*(i+0.5)/NS, rr=Math.sqrt(Math.max(0,1-y*y)), a=GA*i;
+      const dir=new THREE.Vector3(rr*Math.cos(a), y, rr*Math.sin(a));
+      const dHit=Math.acos(Math.max(-1,Math.min(1,dir.dot(hitDir))));
+      // finer fragmentation near the hit, big slabs on the far side
+      const angR=(0.24+0.36*(dHit/Math.PI))*(0.85+0.3*Math.random());
+      const sh=makeShardGeo(dir, angR, 8, 0.16+0.20*Math.random(), R);
+      shardGeos.push(sh.geo);
+      const m=new THREE.Mesh(sh.geo,[outerMat,chunkMat]);
+      m.position.copy(sh.center);
+      const vel=velOf(dir);
+      const spin=vel.length()/R;
+      chunks.push({m,vel,rot:new THREE.Vector3((Math.random()-0.5)*2.4*spin,(Math.random()-0.5)*2.4*spin,(Math.random()-0.5)*2.4*spin)});
+      group.add(m);
+    }
+  }
+  // small rubble between the slabs (generic hot rocks, impact-driven too)
+  const NCH=Math.round((shardGeos.length?18:46)*(1-0.72*gas)*(MOBILE_UI?0.65:1));
+  const szF=1-0.35*gas;
+  for(let i=0;i<NCH;i++){
+    const m=new THREE.Mesh(geos[i%3], chunkMat);
+    const dir=new THREE.Vector3(Math.random()*2-1,Math.random()*2-1,Math.random()*2-1).normalize();
+    m.position.copy(dir).multiplyScalar(R*(0.35+0.6*Math.random()));
+    m.scale.setScalar(R*(0.04+0.09*Math.random())*szF);
+    m.rotation.set(Math.random()*6,Math.random()*6,Math.random()*6);
+    const vel=velOf(dir).multiplyScalar(1.35);
+    chunks.push({m,vel,rot:new THREE.Vector3(Math.random()*2-1,Math.random()*2-1,Math.random()*2-1)});
+    group.add(m);
+  }
+  // gas/dust haze: additive glow points that expand outward and dissipate.
+  // Amount, spread, brightness and lifetime all scale with the gas fraction;
+  // tinted by the body's own colour (Amunet bursts bronze, Wadjet teal).
+  const HN=Math.round(500+1600*gas), hp=new Float32Array(HN*3);
+  for(let i=0;i<HN;i++){
+    const d=new THREE.Vector3(Math.random()*2-1,Math.random()*2-1,Math.random()*2-1).normalize()
+      .multiplyScalar(R*(0.5+(1.0+0.9*gas)*Math.random()));
+    hp[i*3]=d.x; hp[i*3+1]=d.y; hp[i*3+2]=d.z;
+  }
+  const hg=new THREE.BufferGeometry();
+  hg.setAttribute('position', new THREE.BufferAttribute(hp,3).setUsage(THREE.DynamicDrawUsage));
+  const tint=new THREE.Color(rec.data.color||0xffd9b0).lerp(new THREE.Color(1,1,1),0.35);
+  // NB: PointsMaterial.size is WORLD units — it ignores the mesh's per-frame
+  // dot-floor scaling, so the update loop re-syncs it to mesh.scale each frame.
+  // gassy worlds die in a luminous cloud of their own colour; rocky ones in
+  // INCANDESCENT dust — small, dim-orange additive embers (big bright points
+  // saturated the frame white; gray smoke hid the glowing fragments)
+  const glowy = gas>=0.6;
+  const hzSize=glowy?R*(0.12+0.42*gas):R*0.09, hzOp=glowy?0.55*(0.45+0.85*gas):0.5;
+  const hazeMat=new THREE.PointsMaterial({
+    map:glowy?glowCanvasTex('rgba(255,235,205,0.85)','rgba(160,120,85,0.28)')
+             :glowCanvasTex('rgba(255,150,70,0.75)','rgba(120,30,8,0.18)'),
+    color:glowy?tint:new THREE.Color(0xff8542), size:hzSize*rec.mesh.scale.x,
+    sizeAttenuation:true, transparent:true, opacity:hzOp,
+    blending:THREE.AdditiveBlending, depthWrite:false});
+  const haze=new THREE.Points(hg,hazeMat); haze.frustumCulled=false;
+  group.add(haze);
+  debrisFields.push({rec,group,chunks,chunkMat,geos,shardGeos,outerMat,haze,hazeMat,t:0,
+    gas, hazeSize:hzSize, op0:hzOp, fadeT:40*(0.6+1.3*gas)});
+}
+
+/* ---- moon liberation: a destroyed planet no longer binds its moons ----
+   Each moon keeps its instantaneous heliocentric state vector — the parent's
+   true Kepler velocity plus the moon's physical orbital velocity around it
+   (vis-viva with the parent's estimated mass) — converted into proper new
+   Ra-centric orbital elements (a, e, plane, periapsis, phase). Runs once per
+   destruction, so accuracy costs nothing per frame. Real units: AU and years,
+   in Kepler form where mu = 4pi^2 * (M / M_sun). */
+const MU_RA=4*Math.PI*Math.PI*1.139;      // AU^3/yr^2 — Ra is 1.139 M_sun
+const SUN_KG=1.989e30;
+function keplerStateAU(aAU,e,q,M,mu){     // -> instantaneous {r (AU), v (AU/yr)}
+  const E=kepler(M,e), b=aAU*Math.sqrt(1-e*e);
+  const n=Math.sqrt(mu/(aAU*aAU*aAU));    // mean motion, rad/yr
+  const Edot=n/(1-e*Math.cos(E));
+  return {
+    r:new THREE.Vector3(aAU*(Math.cos(E)-e),0,b*Math.sin(E)).applyQuaternion(q),
+    v:new THREE.Vector3(-aAU*Math.sin(E)*Edot,0,b*Math.cos(E)*Edot).applyQuaternion(q)
+  };
+}
+/* ---- Kepler shear: the debris of a destroyed world doesn't stay put — each
+   fragment keeps a slightly different orbital period, so over (sim) time the
+   cloud smears along the dead planet's orbit into a glittering arc and finally
+   a full ring. Driven by SIM time: crank the time warp to watch it spread. ---- */
+const debrisRings=[];
+let lastSimDtYears=0;                     // set each frame in animate()
+function makeDebrisRing(rec){
+  const N=MOBILE_UI?700:1400;               // half the sparkles on touch devices — indistinguishable
+  const M0=rec.M%(Math.PI*2), n=Math.PI*2/rec.period;       // mean motion, rad per sim-year
+  const Mi=new Float32Array(N), dn=new Float32Array(N), radJ=new Float32Array(N), vertJ=new Float32Array(N);
+  const over=Math.max(1,(rec.dmgJ||0)/impBindingJ(rec));
+  const ovk=Math.min(3, Math.log10(over)+1);
+  const spread=0.004*(0.4+0.6*ovk);                          // fractional Δn → shear rate scales with overkill
+  const pos=new Float32Array(N*3), col=new Float32Array(N*3);
+  const tint=new THREE.Color(rec.data.color||0xffd9b0);
+  for(let i=0;i<N;i++){
+    Mi[i]=M0+(Math.random()-0.5)*0.06;
+    dn[i]=n*spread*(Math.random()*2-1);
+    radJ[i]=(Math.random()-0.5)*0.012;                       // fraction of the orbit radius
+    vertJ[i]=(Math.random()-0.5)*0.006;
+    const c=tint.clone().lerp(new THREE.Color(1,1,1),0.25+0.5*Math.random())
+      .multiplyScalar(0.35+0.65*Math.random());              // varied brightness = glitter
+    col[i*3]=c.r; col[i*3+1]=c.g; col[i*3+2]=c.b;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos,3).setUsage(THREE.DynamicDrawUsage));
+  g.setAttribute('color', new THREE.BufferAttribute(col,3));
+  const m=new THREE.PointsMaterial({map:glowCanvasTex('rgba(255,245,225,1)','rgba(255,210,150,0)'),
+    vertexColors:true, size:1, sizeAttenuation:true, transparent:true, opacity:0.9,
+    blending:THREE.AdditiveBlending, depthWrite:false});
+  const points=new THREE.Points(g,m); points.frustumCulled=false;
+  rec.parentHolder.add(points);                              // moons ring their parent planet
+  debrisRings.push({rec,points,g,Mi,dn,radJ,vertJ,n,t:0});
+  updateDebrisRings(0);                                      // place the points immediately
+}
+function updateDebrisRings(dtYears){
+  for(const D of debrisRings){
+    const rec=D.rec, a=rec.aDisp, e=rec.e;
+    D.t+=dtYears;
+    // lazy: accumulate sim-time and only recompute once the points would have
+    // visibly moved (>~3e-4 rad along the orbit) or the display scale changed.
+    // At real-time rates the ring costs nothing; at high warp it shears live.
+    D.pend=(D.pend||0)+dtYears;
+    if(D.init && a===D.lastA && e===D.lastE && D.pend*D.n*1.05<3e-4) continue;
+    const step=D.pend; D.pend=0; D.init=true; D.lastA=a; D.lastE=e;
+    const posA=D.g.attributes.position, b=a*Math.sqrt(1-e*e);
+    for(let i=0;i<D.Mi.length;i++){
+      D.Mi[i]+=(D.n+D.dn[i])*step;
+      const E=kepler(D.Mi[i]%(Math.PI*2), e);
+      const rj=1+D.radJ[i];
+      _impV3.set(a*(Math.cos(E)-e)*rj, D.vertJ[i]*a, b*Math.sin(E)*rj).applyQuaternion(rec.q);
+      posA.setXYZ(i,_impV3.x,_impV3.y,_impV3.z);
+    }
+    posA.needsUpdate=true;
+    D.points.material.size=a*0.006;                          // tracks scale-mode changes
+  }
+}
+
+/* state vector {r AU, v AU/yr} -> orbital elements, engine conventions
+   (orbit normal = local -y; see positionBody). Shared by moon liberation
+   and impact-momentum orbit perturbation. */
+function stateToElements(r,v,mu){
+  const rl=r.length(), v2=v.lengthSq();
+  let a=1/(2/rl - v2/mu);
+  const h=new THREE.Vector3().crossVectors(r,v);
+  const ev=r.clone().multiplyScalar(v2-mu/rl).addScaledVector(v,-r.dot(v)).multiplyScalar(1/mu);
+  let e=ev.length();
+  if(!(a>0) || e>=0.985){ e=Math.min(e,0.985); a=rl/(1-0.9*e); }  // ejection edge case: keep it drawably bound
+  const ph=e>1e-6 ? ev.normalize() : r.clone().normalize();       // periapsis direction
+  const hn=h.lengthSq()>1e-12 ? h.normalize() : new THREE.Vector3(0,1,0);
+  const Y=hn.clone().negate(), Z=new THREE.Vector3().crossVectors(ph,Y);
+  const qn=new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(ph,Y,Z));
+  let nu=Math.acos(Math.max(-1,Math.min(1, r.clone().normalize().dot(ph))));
+  if(r.dot(v)<0) nu=Math.PI*2-nu;                                 // inbound half of the orbit
+  const E2=2*Math.atan2(Math.sqrt(1-e)*Math.sin(nu/2), Math.sqrt(1+e)*Math.cos(nu/2));
+  return {a, e, q:qn, M:E2-e*Math.sin(E2)};
+}
+
+/* impact momentum: dv = m·v / M — recompute the struck body's orbit from its
+   perturbed state vector, exactly. Planets get true new heliocentric elements;
+   moons get exact new local elements with the display pacing scaled by Kepler. */
+const KMS_PER_AUYR=4.74047;
+function perturbOrbit(rec, dirWorld, dvKms){
+  if(!(dvKms>1e-7) || rec.data.kind==='star' || rec.destroyed) return false;
+  const dvA=dvKms/KMS_PER_AUYR;
+  if(rec.helio){
+    const aCur=rec.helioA!=null?rec.helioA:rec.data.dist;
+    const st=keplerStateAU(aCur, rec.e, rec.q, rec.M%(Math.PI*2), MU_RA);
+    st.v.addScaledVector(dirWorld, dvA);
+    const el=stateToElements(st.r, st.v, MU_RA);
+    if(!rec._origOrbit) rec._origOrbit={helio:true, helioA:rec.helioA, e:rec.e, q:rec.q.clone(), period:rec.period};
+    rec.helioA=el.a; rec.e=el.e; rec.q=el.q; rec.M=el.M;
+    rec.period=Math.sqrt(el.a*el.a*el.a/1.139);
+    rec.aDisp=distDisp(el.a);
+  } else if(rec.isMoon){
+    const pRec=bodies.find(b=>b.holder===rec.parentHolder);
+    if(!pRec) return false;
+    const muP=4*Math.PI*Math.PI*(impBodyMassKg(pRec)/SUN_KG);
+    const aCur=rec._physA!=null?rec._physA:rec.data.dist;
+    const st=keplerStateAU(aCur, rec.e, rec.q, rec.M%(Math.PI*2), muP);
+    st.v.addScaledVector(dirWorld, dvA);
+    const el=stateToElements(st.r, st.v, muP);
+    if(!rec._origOrbit) rec._origOrbit={helio:false, _physA:rec._physA||null, e:rec.e, q:rec.q.clone(),
+      period:rec.period, aDispReal:rec.aDispReal, aDispCompressed:rec.aDispCompressed};
+    const ratio=el.a/aCur;
+    rec._physA=el.a; rec.e=el.e; rec.q=el.q; rec.M=el.M;
+    rec.period*=Math.pow(ratio,1.5);       // keep the tuned display pacing, scaled by Kepler's third law
+    rec.aDispReal*=ratio; rec.aDispCompressed*=ratio;
+    rec.aDisp=realScale?rec.aDispReal:rec.aDispCompressed;
+  } else return false;
+  if(rec.orbitLine){ rebuildOrbitLine(rec); rec.orbitLine.quaternion.copy(rec.q); }
+  rec.orbitPerturbed=true;
+  positionBody(rec);
+  return true;
+}
+
+function liberateMoons(parentRec){
+  const muP=4*Math.PI*Math.PI*(impBodyMassKg(parentRec)/SUN_KG);
+  const ps=keplerStateAU(parentRec.data.dist, parentRec.e, parentRec.q, parentRec.M%(Math.PI*2), MU_RA);
+  for(const m of bodies){
+    if(m.parentHolder!==parentRec.holder || m===parentRec || m.destroyed) continue;
+    const ms=keplerStateAU(m._physA!=null?m._physA:m.data.dist, m.e, m.q, m.M%(Math.PI*2), muP);
+    const r=ps.r.clone().add(ms.r), v=ps.v.clone().add(ms.v);
+    const el=stateToElements(r,v,MU_RA);
+    const a=el.a, e=el.e, qn=el.q;
+    // stash the pre-destruction orbit for 🧽 Heal, then rewire to Ra
+    m._preLib={parentRec, isMoon:m.isMoon, aDispReal:m.aDispReal, aDispCompressed:m.aDispCompressed,
+               e:m.e, q:m.q, M:m.M, period:m.period, orbitLine:m.orbitLine};
+    if(m.orbitLine) m.orbitLine.visible=false;      // the old ellipse around the dead parent
+    m.parentHolder=sunHolder; sunHolder.add(m.holder);
+    m.helio=true; m.isMoon=false; m.helioA=a;
+    m.e=e; m.q=qn; m.M=el.M;
+    m.period=Math.sqrt(a*a*a/1.139);                // real Kepler years, like every helio body
+    m.aDisp=distDisp(a);
+    const g=new THREE.BufferGeometry().setFromPoints(orbitPoints(m.aDisp,e));
+    const lm=new THREE.LineBasicMaterial({color:new THREE.Color(m.data.color||0x88aaff),transparent:true,opacity:0.32});
+    m.orbitLine=new THREE.Line(g,lm); m.orbitLine.quaternion.copy(qn); m.orbitLine.visible=showOrbits;
+    sunHolder.add(m.orbitLine);
+    const le=labelEls[m.data.key]; if(le) le.classList.add('major');   // labelled at system zoom, like a planet
+    positionBody(m);
+  }
+}
+
+function removeDebrisField(rec){
+  // resurrecting the planet re-captures its liberated moons onto their old orbits
+  for(const m of bodies){
+    if(!m._preLib || m._preLib.parentRec!==rec) continue;
+    if(m.orbitLine){ sunHolder.remove(m.orbitLine); m.orbitLine.geometry.dispose(); m.orbitLine.material.dispose(); }
+    const P=m._preLib;
+    m.orbitLine=P.orbitLine; if(m.orbitLine) m.orbitLine.visible=showOrbits;
+    m.parentHolder=rec.holder; rec.holder.add(m.holder);
+    m.helio=false; m.isMoon=P.isMoon; m.helioA=null;
+    m._origOrbit=null; m.orbitPerturbed=false; m._physA=null;   // _preLib restore wins over any nudge
+    m.e=P.e; m.q=P.q; m.M=P.M; m.period=P.period;
+    m.aDispReal=P.aDispReal; m.aDispCompressed=P.aDispCompressed;
+    m.aDisp=realScale?P.aDispReal:P.aDispCompressed;
+    const le=labelEls[m.data.key]; if(le && m.data.parent!==DS.STAR.key) le.classList.remove('major');
+    positionBody(m);
+    m._preLib=null;
+  }
+  for(let i=debrisFields.length-1;i>=0;i--){
+    const D=debrisFields[i]; if(D.rec!==rec) continue;
+    rec.mesh.remove(D.group);
+    for(const g of D.geos) g.dispose();
+    for(const g of (D.shardGeos||[])) g.dispose();
+    if(D.outerMat){ if(D.outerMat.map){ unregCanvasTex(D.outerMat.map); D.outerMat.map.dispose(); }
+      if(D.outerMat.emissiveMap) D.outerMat.emissiveMap.dispose(); D.outerMat.dispose(); }
+    D.chunkMat.dispose();
+    if(D.haze){ D.haze.geometry.dispose(); unregCanvasTex(D.hazeMat.map); D.hazeMat.map.dispose(); D.hazeMat.dispose(); }
+    debrisFields.splice(i,1);
+  }
+  for(let i=debrisRings.length-1;i>=0;i--){
+    const D=debrisRings[i]; if(D.rec!==rec) continue;
+    rec.parentHolder.remove(D.points); D.g.dispose();
+    unregCanvasTex(D.points.material.map); D.points.material.map.dispose(); D.points.material.dispose();
+    debrisRings.splice(i,1);
+  }
+  rec.mesh.material.visible=true;
+  for(const ch of rec.mesh.children) ch.visible=true;
+  rec.destroyed=false;
+  updateNavStatus(rec);
+  const el=labelEls[rec.data.key]; if(el) el.textContent=locName(rec.data);
+}
+
+function impHeal(){
+  for(const rec of impScarred){
+    const s=rec.scar;
+    s.charC.getContext('2d').clearRect(0,0,s.charC.width,s.charC.height);
+    s.glowC.getContext('2d').clearRect(0,0,s.glowC.width,s.glowC.height);
+    s.meltC.getContext('2d').clearRect(0,0,s.meltC.width,s.meltC.height);
+    s.log.length=0; s.dirty=false;
+    s.charT.needsUpdate=true; s.glowT.needsUpdate=true; s.meltT.needsUpdate=true;
+    if(s.ocean){ s.ocean.material.opacity=0; s.ocean.material.color.setScalar(1); }
+    if(s.halo) s.halo.material.uniforms.p.value=0;
+    if(s.wocean) s.wocean.material.opacity=0;
+    if(s.steam) s.steam.material.opacity=0;
+    if(s.steamHalo) s.steamHalo.material.uniforms.p.value=0;
+    s.oceanM=0; s.oceanHot=0; s.waterM=0; s.steamM=0; s.meltArea=0;
+    rec.dmgJ=0; rec.shattered=false;
+    // deflate a puffed-up giant and calm its boosted/created escape tail
+    rec.puffTarget=1; rec.puffK=1;
+    if(rec._baseEmissive && rec.mesh.material.emissive){
+      rec.mesh.material.emissive.copy(rec._baseEmissive.c);
+      rec.mesh.material.emissiveIntensity=rec._baseEmissive.i; rec._baseEmissive=null;
+    }
+    if(rec._puffTail){
+      const t=rec._puffTail;
+      if(t._created){ scene.remove(t.points); t.g.dispose(); t.points.material.dispose();
+        const ti=evapTails.indexOf(t); if(ti>=0) evapTails.splice(ti,1); }
+      else if(t._base){ t.rate=t._base.rate; t.points.material.uniforms.uAlpha.value=t._base.alpha; t._base=null; }
+      rec._puffTail=null;
+    }
+    if(rec.destroyed) removeDebrisField(rec);   // resurrect the world
+  }
+  if(!realScale) applySizes();                  // deflated giants: reapply compressed-mode scales
+  // undo impact-momentum orbit changes (liberated moons were restored above)
+  for(const rec of bodies){
+    if(!rec._origOrbit || rec._preLib){ if(rec._preLib) rec._origOrbit=null; continue; }
+    const O=rec._origOrbit;
+    rec.e=O.e; rec.q=O.q; rec.period=O.period;
+    if(O.helio){ rec.helioA=O.helioA; rec.aDisp=distDisp(rec.helioA!=null?rec.helioA:rec.data.dist); }
+    else { rec._physA=O._physA; rec.aDispReal=O.aDispReal; rec.aDispCompressed=O.aDispCompressed;
+           rec.aDisp=realScale?rec.aDispReal:rec.aDispCompressed; }
+    if(rec.orbitLine){ rebuildOrbitLine(rec); rec.orbitLine.quaternion.copy(rec.q); }
+    rec.orbitPerturbed=false; rec._origOrbit=null;
+    positionBody(rec);
+  }
+  for(const t of evapTails) t.points.visible=showTails;
+  if(APP.currentData && document.getElementById('info').classList.contains('open'))
+    openInfo(APP.currentData);
+  sfxChime();
+}
+
+/* ============================================================
+   Sound effects — procedural Web Audio, no files (offline).
+   Not realistic (space is silent) — rule of cool, off by default.
+   Master bus: compressor glue + a synthesized 2.6 s hall reverb.
+   ============================================================ */
+let sfxOn=false, sfxAC=null, sfxMaster=null, sfxNoiseBuf=null, sfxBeamN=null;
+function sfxCtx(){
+  if(sfxAC) return sfxAC;
+  const Ctor=window.AudioContext||window.webkitAudioContext; if(!Ctor) return null;
+  sfxAC=new Ctor();
+  const comp=sfxAC.createDynamicsCompressor();
+  comp.threshold.value=-18; comp.knee.value=18; comp.ratio.value=6;
+  comp.attack.value=0.004; comp.release.value=0.28;
+  comp.connect(sfxAC.destination);
+  sfxMaster=sfxAC.createGain(); sfxMaster.gain.value=0.9;
+  sfxMaster.connect(comp);
+  const sr=sfxAC.sampleRate, ir=sfxAC.createBuffer(2,2.6*sr|0,sr);   // exp-decaying noise = hall
+  for(let ch=0;ch<2;ch++){ const d=ir.getChannelData(ch);
+    for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/d.length,3.2); }
+  const verb=sfxAC.createConvolver(); verb.buffer=ir;
+  const wet=sfxAC.createGain(); wet.gain.value=0.35;
+  sfxMaster.connect(verb); verb.connect(wet); wet.connect(comp);
+  return sfxAC;
+}
+function sfxReady(){ if(!sfxOn||!sfxCtx()) return false;
+  if(sfxAC.state==='suspended') sfxAC.resume();               // strikes ARE user gestures
+  return sfxAC.state!=='closed';
+}
+function sfxNoiseSrc(){
+  if(!sfxNoiseBuf){ sfxNoiseBuf=sfxAC.createBuffer(1,sfxAC.sampleRate*2,sfxAC.sampleRate);
+    const d=sfxNoiseBuf.getChannelData(0); for(let i=0;i<d.length;i++) d[i]=Math.random()*2-1; }
+  const s=sfxAC.createBufferSource(); s.buffer=sfxNoiseBuf; s.loop=true; return s;
+}
+function sfxDistGain(rec){                                    // closer to the fireworks = louder
+  const R=rec.radius*rec.mesh.scale.x||1;
+  const d=camera.position.distanceTo(worldPosOf(rec));
+  return Math.max(0.12, Math.min(1, Math.sqrt(8*R/Math.max(d,8*R))));
+}
+/* one boom: sine sub-drop + noise crack through a sweeping lowpass; k 0..1 sizes it */
+function sfxBoom(g0,k,t){
+  const o=sfxAC.createOscillator(); o.type='sine';
+  o.frequency.setValueAtTime(120-60*k,t); o.frequency.exponentialRampToValueAtTime(24,t+0.5+1.2*k);
+  const og=sfxAC.createGain(); og.gain.setValueAtTime(0.9*g0,t);
+  og.gain.exponentialRampToValueAtTime(1e-4,t+0.9+1.6*k);
+  o.connect(og); og.connect(sfxMaster); o.start(t); o.stop(t+1+1.7*k);
+  const n=sfxNoiseSrc(), f=sfxAC.createBiquadFilter(); f.type='lowpass';
+  f.frequency.setValueAtTime(6000,t); f.frequency.exponentialRampToValueAtTime(120,t+0.7+1.5*k);
+  const ng=sfxAC.createGain(); ng.gain.setValueAtTime(0.7*g0,t);
+  ng.gain.exponentialRampToValueAtTime(1e-4,t+0.8+1.8*k);
+  n.connect(f); f.connect(ng); ng.connect(sfxMaster); n.start(t); n.stop(t+1+2*k);
+}
+function sfxImpact(rec,E){
+  if(!sfxReady()) return;
+  const k=Math.min(1,Math.max(0,(Math.log10(Math.max(1,E))-20)/14));   // 1e20..1e34 J → 0..1
+  sfxBoom(sfxDistGain(rec)*(0.35+0.65*k), k, sfxAC.currentTime);
+}
+function sfxShatter(rec){
+  if(!sfxReady()) return;
+  const t=sfxAC.currentTime, g0=Math.max(0.5,sfxDistGain(rec));
+  sfxBoom(g0*1.2, 1, t);
+  const n=sfxNoiseSrc(), f=sfxAC.createBiquadFilter();       // long seismic rumble
+  f.type='lowpass'; f.frequency.setValueAtTime(90,t); f.frequency.exponentialRampToValueAtTime(35,t+6);
+  const ng=sfxAC.createGain(); ng.gain.setValueAtTime(0.8*g0,t+0.15);
+  ng.gain.exponentialRampToValueAtTime(1e-4,t+7);
+  n.connect(f); f.connect(ng); ng.connect(sfxMaster); n.start(t); n.stop(t+7.2);
+  for(let i=0;i<14;i++){                                     // debris crackle
+    const ct=t+0.15+Math.random()*2.2, cd=0.04+Math.random()*0.09;
+    const c=sfxNoiseSrc(), cf=sfxAC.createBiquadFilter();
+    cf.type='bandpass'; cf.frequency.value=400+Math.random()*2100; cf.Q.value=2.5;
+    const cg=sfxAC.createGain(); cg.gain.setValueAtTime(0,ct);
+    cg.gain.linearRampToValueAtTime((0.08+Math.random()*0.22)*g0,ct+0.008);
+    cg.gain.exponentialRampToValueAtTime(1e-4,ct+cd);
+    c.connect(cf); cf.connect(cg); cg.connect(sfxMaster); c.start(ct); c.stop(ct+cd+0.05);
+  }
+}
+function sfxWhoosh(T){                                        // asteroid run-in, rises toward arrival
+  if(!sfxReady()) return;
+  const t=sfxAC.currentTime, d=Math.min(T,3.2);
+  const n=sfxNoiseSrc(), f=sfxAC.createBiquadFilter();
+  f.type='bandpass'; f.Q.value=1.1;
+  f.frequency.setValueAtTime(260,t); f.frequency.exponentialRampToValueAtTime(1600,t+d);
+  const g=sfxAC.createGain(); g.gain.setValueAtTime(1e-4,t);
+  g.gain.exponentialRampToValueAtTime(0.16,t+d*0.85); g.gain.exponentialRampToValueAtTime(1e-4,t+d);
+  n.connect(f); f.connect(g); g.connect(sfxMaster); n.start(t); n.stop(t+d+0.05);
+}
+function sfxBeamStart(){
+  if(!sfxReady()||sfxBeamN) return;
+  const t=sfxAC.currentTime, b=Math.min(1,Math.max(0,(Math.log10(impPowW)-12)/22));
+  const g=sfxAC.createGain(); g.gain.setValueAtTime(1e-4,t);
+  g.gain.exponentialRampToValueAtTime(0.20+0.14*b,t+0.12);
+  g.connect(sfxMaster);
+  const f=sfxAC.createBiquadFilter(); f.type='lowpass'; f.frequency.value=320+520*b; f.Q.value=8;
+  f.connect(g);
+  const o1=sfxAC.createOscillator(); o1.type='sawtooth'; o1.frequency.value=64;
+  const o2=sfxAC.createOscillator(); o2.type='sawtooth'; o2.frequency.value=64.7;   // slow beat
+  o1.connect(f); o2.connect(f);
+  const lfo=sfxAC.createOscillator(); lfo.frequency.value=5.5;                      // filter wobble
+  const lg=sfxAC.createGain(); lg.gain.value=120+90*b; lfo.connect(lg); lg.connect(f.frequency);
+  const sh=sfxAC.createOscillator(); sh.type='sine'; sh.frequency.value=1960;       // shimmer
+  const vib=sfxAC.createOscillator(); vib.frequency.value=7;
+  const vg=sfxAC.createGain(); vg.gain.value=26; vib.connect(vg); vg.connect(sh.frequency);
+  const sg=sfxAC.createGain(); sg.gain.value=0.05; sh.connect(sg); sg.connect(g);
+  const hiss=sfxNoiseSrc(), hf=sfxAC.createBiquadFilter();
+  hf.type='bandpass'; hf.frequency.value=3000; hf.Q.value=1.2;
+  const hg=sfxAC.createGain(); hg.gain.value=0.05; hiss.connect(hf); hf.connect(hg); hg.connect(g);
+  for(const x of [o1,o2,lfo,sh,vib,hiss]) x.start(t);
+  sfxBeamN={g, stops:[o1,o2,lfo,sh,vib,hiss]};
+}
+function sfxBeamStop(){
+  if(!sfxBeamN||!sfxAC) return;
+  const N=sfxBeamN, t=sfxAC.currentTime; sfxBeamN=null;
+  N.g.gain.cancelScheduledValues(t); N.g.gain.setValueAtTime(N.g.gain.value,t);
+  N.g.gain.exponentialRampToValueAtTime(1e-4,t+0.15);
+  for(const x of N.stops){ try{ x.stop(t+0.2); }catch(_){} }
+  setTimeout(()=>{ try{ N.g.disconnect(); }catch(_){} },400);
+}
+function sfxChime(){                                          // 🧽 Heal: a soft two-note bell
+  if(!sfxReady()) return;
+  const t=sfxAC.currentTime;
+  [[880,0],[1318.5,0.09]].forEach(([hz,dt])=>{
+    const o=sfxAC.createOscillator(); o.type='sine'; o.frequency.value=hz;
+    const g=sfxAC.createGain(); g.gain.setValueAtTime(0,t+dt);
+    g.gain.linearRampToValueAtTime(0.16,t+dt+0.012); g.gain.exponentialRampToValueAtTime(1e-4,t+dt+1.1);
+    o.connect(g); g.connect(sfxMaster); o.start(t+dt); o.stop(t+dt+1.2);
+  });
+}
+function toggleSfx(){
+  sfxOn=!sfxOn;
+  try{ localStorage.setItem('ra-sfx', sfxOn?'1':'0'); }catch(_){}
+  const b=document.getElementById('t-sfx'); if(b) b.classList.toggle('on',sfxOn);
+  if(sfxOn){ if(sfxReady()){ sfxChime(); if(impBeam) sfxBeamStart(); } }
+  else { sfxBeamStop(); if(sfxAC&&sfxAC.state==='running') sfxAC.suspend(); }
+}
+
+/* ---- asteroid projectiles: jittered rock + glow, homing at the chosen surface point ---- */
+function launchAsteroid(rec, hit){
+  const u=hit.uv?hit.uv.x:0.5, v=hit.uv?hit.uv.y:0.5;
+  const E=impKE();
+  const tgtR=rec.radius*rec.mesh.scale.x;
+  const size=Math.max(tgtR*0.05, Math.min(tgtR*0.45, tgtR*0.45*Math.cbrt(impDiaKm/1000)));
+  // pooled rig (shared geometry + material + glow sprite) — no per-shot alloc/dispose
+  const rig=acquireAstRig();
+  const mesh=rig.mesh;
+  mesh.scale.setScalar(size);
+  // approach ~40° off the camera line so the run-in is visible
+  const tgtW=uvToWorld(rec,u,v);
+  const camDir=_impV1.copy(tgtW).sub(camera.position).normalize();
+  const side=_impV2.set(0,1,0).cross(camDir);
+  if(side.lengthSq()<1e-8) side.set(1,0,0).cross(camDir);   // looking straight down the pole
+  side.normalize().applyAxisAngle(camDir,Math.random()*Math.PI*2);
+  const A=camDir.multiplyScalar(Math.cos(0.7)).addScaledVector(side,Math.sin(0.7)).normalize();
+  const dist=Math.max(tgtR*10, camera.position.distanceTo(tgtW)*0.35);
+  const start=tgtW.clone().addScaledVector(A,-dist);
+  const T=Math.min(3.6, Math.max(1.4, 3.6-0.55*Math.log10(impSpdKms/11)));
+  impAsteroids.push({rec,u,v,rig,mesh,start,t:0,T,E,
+    mKg:impRho*(Math.PI/6)*Math.pow(impDiaKm*1000,3), vKms:impSpdKms,   // for the momentum kick
+    spin:new THREE.Vector3(Math.random()*4-2,Math.random()*4-2,Math.random()*4-2)});
+  sfxWhoosh(T);
+}
+
+/* ---- laser: frozen world-space ray; the body orbits/rotates through it ---- */
+function startBeam(rec, e){
+  if(impBeam) stopBeam();
+  const r=renderer.domElement.getBoundingClientRect();
+  mouse.x=((e.clientX-r.left)/r.width)*2-1;
+  mouse.y=-((e.clientY-r.top)/r.height)*2+1;
+  impRC.setFromCamera(mouse,camera);
+  const geo=new THREE.CylinderGeometry(1,1,1,10,1,true);
+  const core=new THREE.Mesh(geo,new THREE.MeshBasicMaterial({color:0xfff6ea,transparent:true,opacity:0.85,
+    blending:THREE.AdditiveBlending,depthWrite:false}));
+  const sheath=new THREE.Mesh(geo.clone(),new THREE.MeshBasicMaterial({color:0xff5030,transparent:true,opacity:0.26,
+    blending:THREE.AdditiveBlending,depthWrite:false}));
+  const hitGlow=new THREE.Sprite(new THREE.SpriteMaterial({map:impFlashTexture(),transparent:true,
+    blending:THREE.AdditiveBlending,depthWrite:false}));
+  scene.add(core); scene.add(sheath); scene.add(hitGlow);
+  impBeam={rec, origin:impRC.ray.origin.clone(), dir:impRC.ray.direction.clone(),
+    core, sheath, hitGlow, missT:0, sparkT:0, firedJ:0};
+  controls.enabled=false;
+  sfxBeamStart();
+}
+function stopBeam(){
+  if(!impBeam) return;
+  sfxBeamStop();
+  for(const o of [impBeam.core,impBeam.sheath,impBeam.hitGlow]){
+    scene.remove(o); if(o.geometry) o.geometry.dispose(); o.material.dispose();
+  }
+  impBeam=null;
+  if(!flying) controls.enabled=true;
+}
+const _cylUp=new THREE.Vector3(0,1,0), _cylD=new THREE.Vector3();
+function placeCyl(mesh,a,b,r){
+  _cylD.copy(b).sub(a); const len=_cylD.length()||1e-6;
+  mesh.position.copy(a).addScaledVector(_cylD,0.5);
+  mesh.quaternion.setFromUnitVectors(_cylUp,_cylD.multiplyScalar(1/len));
+  mesh.scale.set(r,len,r);
+}
+
+/* ---- per-frame update (wall-clock dt) ---- */
+function updateImpacts(dt){
+  // asteroids (iterate backwards: strikes splice)
+  for(let i=impAsteroids.length-1;i>=0;i--){
+    const a=impAsteroids[i];
+    a.t+=dt;
+    const tgt=uvToWorld(a.rec,a.u,a.v);
+    const k=a.t/a.T;
+    if(k>=1){
+      applyStrike(a.rec,a.u,a.v,a.E,{mKg:a.mKg, vKms:a.vKms, dir:tgt.clone().sub(a.start).normalize()});
+      releaseAstRig(a.rig);                  // back to the pool — no dispose (reused next shot)
+      impAsteroids.splice(i,1); continue;
+    }
+    const e=k*k*(3-2*k);
+    a.mesh.position.lerpVectors(a.start,tgt,e);
+    a.mesh.rotation.x+=a.spin.x*dt; a.mesh.rotation.y+=a.spin.y*dt; a.mesh.rotation.z+=a.spin.z*dt;
+  }
+  // laser — follows the pointer; sweeping onto another world retargets it
+  if(impBeam){
+    impRC.ray.origin.copy(impBeam.origin); impRC.ray.direction.copy(impBeam.dir);
+    const all=impRC.intersectObjects(pickables,false);
+    let hit=null;
+    for(const h of all){                 // debris fields don't stop the beam
+      const r2=bodies.find(b=>b.data.key===h.object.userData.bodyKey);
+      if(r2 && !r2.destroyed){ hit=h; impBeam.rec=r2; break; }
+    }
+    if(hit){
+      impBeam.missT=0;
+      const EJ=impPowW*dt;
+      impBeam.firedJ+=EJ;
+      const rec=impBeam.rec, R=rec.radius*rec.mesh.scale.x;
+      if(!impImmune(rec) && !rec.destroyed){
+        const s=getScars(rec);
+        const th=Math.min(20, Math.max(0.5, 1.2*Math.cbrt(impPowW/1e18)));
+        const rPx=th/180*512;
+        const gasy=(rec.data.kind==='gasgiant');
+        if(hit.uv){
+          if(!gasy){
+            impSplat(s.charC.getContext('2d'), hit.uv.x, 1-hit.uv.y, rPx*0.55, IMP_CHAR_SOFT);
+            impSplat(s.meltC.getContext('2d'), hit.uv.x, 1-hit.uv.y, rPx*0.30, IMP_LAVA_SOFT);  // the burn line stays molten
+            scarLog(s,'c',hit.uv.x,1-hit.uv.y,rPx*0.55,IMP_CHAR_SOFT,null);
+            scarLog(s,'m',hit.uv.x,1-hit.uv.y,rPx*0.30,IMP_LAVA_SOFT,null);
+            addMeltArea(s, th*0.30);          // the beam is melting the surface it burns
+          }
+          impSplat(s.glowC.getContext('2d'), hit.uv.x, 1-hit.uv.y, rPx, IMP_GLOW_SOFT);
+          s.dirty=true; s.hot=7;     // GPU upload batched in the scar loop (~10 Hz, not per frame)
+        }
+        rec.dmgJ=(rec.dmgJ||0)+EJ;
+        if(hit.uv) rec._lastHit={u:hit.uv.x, v:hit.uv.y};
+        impUpdateMelt(rec);
+        if(rec.dmgJ>=impBindingJ(rec) && !rec.shattered) shatterBody(rec);
+      }
+      const ref=camera.position.distanceTo(controls.target);
+      const a=camera.localToWorld(_impV1.set(0.06*ref,-0.045*ref,-0.15*ref));
+      const b=hit.point;
+      const d=camera.position.distanceTo(b);
+      placeCyl(impBeam.core,a,b,d*0.0012);
+      placeCyl(impBeam.sheath,a,b,d*0.0046);
+      impBeam.hitGlow.position.copy(b).addScaledVector(_impV2.copy(b).sub(worldPosOf(impBeam.rec)).normalize(),R*0.03);
+      impBeam.hitGlow.scale.setScalar(R*(0.5+0.15*Math.sin(performance.now()*0.02)));
+      impBeam.sparkT+=dt;
+      if(impBeam.sparkT>0.06){
+        impBeam.sparkT=0;
+        const n=_impV2.copy(b).sub(worldPosOf(impBeam.rec)).normalize().clone();
+        emitBurst(b,6,impConeDir(n,0.9),R*0.5,R*0.05,0.7);
+      }
+      impBeam.core.visible=impBeam.sheath.visible=impBeam.hitGlow.visible=true;
+    } else {
+      impBeam.missT+=dt;
+      impBeam.core.visible=impBeam.sheath.visible=impBeam.hitGlow.visible=false;
+      if(impBeam.missT>1.5) stopBeam();      // forgiving: sweeping between worlds keeps the beam alive
+    }
+  }
+  // one-shot fx sprites
+  for(let i=impFx.length-1;i>=0;i--){
+    const f=impFx[i]; f.t+=dt;
+    const k=f.t/f.T;
+    if(k>=1){ f.o.visible=false; f.pool.push(f.o); impFx.splice(i,1); continue; }   // return to pool, no dispose
+    if(f.kind==='flash'){ f.o.scale.setScalar(f.sc*(0.25+2.0*Math.sqrt(k))); f.o.material.opacity=Math.pow(1-k,1.6); }
+    else { f.o.scale.setScalar(f.sc*(0.3+3.5*k)); f.o.material.opacity=0.55*(1-k); }
+  }
+  // ejecta pool
+  if(impPool && impPoolActiveT>0){
+    impPoolActiveT-=dt;
+    const P=impPool;
+    for(let i=0;i<P.N;i++){
+      if(P.age[i]>=P.life[i]) continue;
+      P.age[i]+=dt;
+      P.pos[i*3]+=P.vel[i*3]*dt; P.pos[i*3+1]+=P.vel[i*3+1]*dt; P.pos[i*3+2]+=P.vel[i*3+2]*dt;
+      P.ageA[i]=Math.min(1,P.age[i]/P.life[i]);
+    }
+    P.g.attributes.position.needsUpdate=true;
+    P.g.attributes.aAge.needsUpdate=true;
+    P.g.attributes.aSize.needsUpdate=true;
+    P.m.uniforms.uScaleH.value=renderer.domElement.height/(2*Math.tan(camera.fov*Math.PI/360));
+  }
+  // debris fields: chunks drift apart and tumble; the dust haze expands and fades
+  for(const D of debrisFields){
+    D.t+=dt;
+    for(const c of D.chunks){
+      c.m.position.addScaledVector(c.vel,dt);
+      c.m.rotation.x+=c.rot.x*dt; c.m.rotation.y+=c.rot.y*dt; c.m.rotation.z+=c.rot.z*dt;
+    }
+    // world-shattering fragments stay incandescent for a long time
+    const cool=0.10+0.90*Math.exp(-D.t/75);
+    D.chunkMat.emissiveIntensity=(D.chunkMat.userData.emberBase||0.6)*cool;
+    if(D.outerMat) D.outerMat.emissiveIntensity=(D.outerMat.userData.emberBase||2.2)*cool;
+    if(D.haze){
+      const fade=1/(1+D.t/D.fadeT);
+      if(fade<0.05){ D.group.remove(D.haze); D.haze.geometry.dispose();
+        unregCanvasTex(D.hazeMat.map); D.hazeMat.map.dispose(); D.hazeMat.dispose(); D.haze=null; }
+      else{
+        D.hazeMat.opacity=D.op0*fade;
+        D.hazeMat.size=D.hazeSize*D.rec.mesh.scale.x;   // track the dot-floor scaling
+        const hp=D.haze.geometry.attributes.position, k=1+dt*0.05;   // slow expansion
+        for(let i=0;i<hp.count;i++) hp.setXYZ(i, hp.getX(i)*k, hp.getY(i)*k, hp.getZ(i)*k);
+        hp.needsUpdate=true;
+      }
+    }
+  }
+  // debris rings shear along the orbit on SIM time (time warp spreads them)
+  if(debrisRings.length) updateDebrisRings(lastSimDtYears);
+  // heat glow cools (shattered worlds are gone); batched, and only while hot —
+  // once faded, no more full-canvas ops or texture re-uploads
+  for(const rec of impScarred){
+    // heated gas giants ease toward their inflated radius
+    if(rec.puffTarget && Math.abs((rec.puffK||1)-rec.puffTarget)>1e-4){
+      rec.puffK=(rec.puffK||1)+(rec.puffTarget-(rec.puffK||1))*Math.min(1,dt*0.9);
+      if(!realScale && !rec.destroyed) rec.mesh.scale.setScalar(sizeMult*bodyF()*rec.puffK);
+    }
+    if(rec.shattered) continue;
+    const s=rec.scar;
+    if(s.wocean && s.waterM>0)
+      s.wocean.material.map.offset.x=(s.wocean.material.map.offset.x+dt*0.006)%1;  // currents
+    if(s.steam && s.steamM>0)
+      s.steam.material.map.offset.x=(s.steam.material.map.offset.x+dt*0.010)%1;    // storm bands
+    if(s.ocean && s.oceanM>0){
+      s.ocean.material.map.offset.x=(s.ocean.material.map.offset.x+dt*0.0045)%1;  // magma churns
+      s.emberT=(s.emberT||0)+dt;
+      // shed incandescent spray — but only when the surface is actually resolved:
+      // a dot-floor-inflated far view would spray planet-sized blobs
+      const R=rec.radius*rec.mesh.scale.x;
+      if(s.emberT>0.13 && (s.oceanM>0.5 || s.oceanHot>0) &&
+         camera.position.distanceTo(worldPosOf(rec))<R*70){
+        s.emberT=0;
+        const n=2+Math.round(5*s.oceanM+9*s.oceanHot);
+        for(let k=0;k<n;k++){
+          const eu=Math.random(), ev2=0.08+0.84*Math.random();
+          const ewp=uvToWorld(rec,eu,ev2);
+          const enr=_impV1.copy(ewp).sub(worldPosOf(rec)).normalize().clone();
+          emitBurst(ewp, 1, impConeDir(enr,0.5), R*(0.25+0.5*s.oceanHot), R*0.05, 0.9);
+        }
+      }
+    }
+    // batched scar uploads: canvas paints are cheap, GPU re-uploads are not —
+    // laser burns mark dirty and we flush at ~10 Hz instead of every frame
+    if(s.dirty){
+      s.upT+=dt;
+      if(s.upT>0.09){ s.charT.needsUpdate=true; s.meltT.needsUpdate=true; s.glowT.needsUpdate=true;
+        s.dirty=false; s.upT=0; }
+    }
+    if(s.hot<=0) continue;
+    s.coolT+=dt; s.hot-=dt;
+    if(s.coolT>0.25){                        // fade cadence: 4 uploads/s, imperceptible vs 8
+      const g=s.glowC.getContext('2d');
+      g.save(); g.globalCompositeOperation='destination-out';
+      g.globalAlpha=Math.min(0.9,0.28*s.coolT); g.fillRect(0,0,s.glowC.width,s.glowC.height); g.restore();
+      s.glowT.needsUpdate=true; s.coolT=0;
+    }
+  }
+  // keep an open info panel's live mass row current while material boils off
+  impInfoT+=dt;
+  if(impInfoT>0.5){
+    impInfoT=0;
+    if(APP.currentData && document.getElementById('info').classList.contains('open')){
+      const rec=bodies.find(b=>b.data.key===APP.currentData.key);
+      if(rec && !rec.destroyed){
+        const cell=document.getElementById('i-mass-now');
+        if(cell) cell.textContent=impMassNowTxt(rec);
+        else if(impMassLostKg(rec)/impBodyMassKg0(rec)>0.001) openInfo(rec.data);  // first crossing: add the row
+      }
+    }
+  }
+  // camera shake (decaying)
+  if(impShake>1e-4){
+    const ref=camera.position.distanceTo(controls.target);
+    camera.position.x+=(Math.random()-0.5)*impShake*ref*0.02;
+    camera.position.y+=(Math.random()-0.5)*impShake*ref*0.02;
+    camera.position.z+=(Math.random()-0.5)*impShake*ref*0.02;
+    impShake*=Math.pow(0.01,dt);
+  } else impShake=0;
+}
+
+/* ---- impact mode + panel UI ---- */
+function toggleImpact(){ impacting?exitImpact():enterImpact(); }
+function enterImpact(){
+  if(flying) exitFly();
+  impRockTex();                 // kick off the rock-texture load before anything fires
+  astRockGeos(); astMaterial(); astGlowMat();   // warm the asteroid pools (no first-shot hitch)
+  // warm the focused body's scar canvases now — the first strike on a body otherwise
+  // builds 3 canvases + 3 textures + 3 overlay spheres in one frame (a visible hitch)
+  const fr=bodies.find(b=>b.data.key===selected);
+  if(fr && !impImmune(fr) && !fr.destroyed) getScars(fr);
+  impacting=true;
+  document.getElementById('implab').classList.add('on');
+  const b=document.getElementById('t-impact'); if(b) b.classList.add('on');
+  updateImpactUI();
+}
+function exitImpact(){
+  impacting=false; stopBeam();
+  document.getElementById('implab').classList.remove('on');
+  const b=document.getElementById('t-impact'); if(b) b.classList.remove('on');
+  renderer.domElement.style.cursor='grab';
+}
+function fmtBigJ(J){
+  const tnt=J/IMP_MT_TNT_J; let t;
+  if(tnt<1)        t=(tnt*1000).toPrecision(2)+' kt';
+  else if(tnt<1e3) t=tnt.toPrecision(2)+' Mt';
+  else if(tnt<1e6) t=(tnt/1e3).toPrecision(2)+' Gt';
+  else if(tnt<1e9) t=(tnt/1e6).toPrecision(2)+' Tt';
+  else             t=(tnt/1e9).toPrecision(2)+' Pt';
+  const chx=J/IMP_CHICXULUB_J;
+  let c=''; if(chx>=0.01) c=' · '+(chx>=100?Math.round(chx).toLocaleString():+chx.toPrecision(2))+'× Chicxulub';
+  return J.toExponential(1).replace('e+','e')+' J · '+t+' TNT'+c;
+}
+function fmtW(W){
+  if(W>=1e27) return W.toExponential(1).replace('e+','e')+' W';
+  const u=[['YW',1e24],['ZW',1e21],['EW',1e18],['PW',1e15],['TW',1e12],['GW',1e9]];
+  for(const p of u) if(W>=p[1]) return +(W/p[1]).toPrecision(3)+' '+p[0];
+  return W.toExponential(1)+' W';
+}
+function fmtKg(kg){
+  if(kg>=1e15) return kg.toExponential(1).replace('e+','e')+' kg';
+  if(kg>=1e12) return +(kg/1e12).toPrecision(3)+' Gt';
+  if(kg>=1e9)  return +(kg/1e9).toPrecision(3)+' Mt';
+  if(kg>=1e6)  return +(kg/1e6).toPrecision(3)+' kt';
+  return Math.round(kg).toLocaleString()+' kg';
+}
+function updateImpactUI(){
+  const dia=document.getElementById('imp-dia'), spd=document.getElementById('imp-spd'), pow=document.getElementById('imp-pow');
+  if(!dia) return;
+  impDiaKm=0.1*Math.pow(10,(+dia.value)/25);                 // 0.1 – 1,000 km, log
+  impSpdKms=11*Math.pow(30000/11,(+spd.value)/100);          // 11 – 30,000 km/s, log
+  impPowW=1e12*Math.pow(10,(+pow.value)*0.22);               // 1e12 – 1e34 W, log — enough to unbind giants
+  impRho=IMP_MATS[impMatI][1];
+  document.getElementById('imp-dia-v').textContent = impDiaKm<10?(+impDiaKm.toPrecision(2)+' km'):(Math.round(impDiaKm).toLocaleString()+' km');
+  document.getElementById('imp-spd-v').textContent = impSpdKms<100?(+impSpdKms.toPrecision(2)+' km/s'):(Math.round(impSpdKms).toLocaleString()+' km/s');
+  document.getElementById('imp-pow-v').textContent = fmtW(impPowW);
+  document.getElementById('imp-mat').textContent = T('mat-'+impMatI);
+  document.getElementById('imp-mass').textContent = fmtKg(impRho*(Math.PI/6)*Math.pow(impDiaKm*1000,3));
+  document.querySelectorAll('#implab .imp-a').forEach(el=>{ el.style.display=impWeapon==='asteroid'?'flex':'none'; });
+  document.querySelectorAll('#implab .imp-l').forEach(el=>{ el.style.display=impWeapon==='laser'?'flex':'none'; });
+  const wb=document.getElementById('imp-weapon');
+  if(wb) wb.textContent = impWeapon==='asteroid'?T('imp-w-ast'):T('imp-w-las');
+  const en=document.getElementById('imp-energy');
+  if(en) en.textContent = impWeapon==='asteroid' ? ('💣 '+fmtBigJ(impKE())) : ('🔥 '+fmtBigJ(impPowW)+' / s');
+  const hint=document.getElementById('imp-hint');
+  if(hint) hint.textContent = impWeapon==='asteroid' ? T('imp-hint-ast') : T('imp-hint-las');
+}
+
+/* ============================================================
    Animation
    ============================================================ */
 let follow=null;            // body rec being followed
@@ -763,31 +2609,36 @@ function animate(){
     elapsedYears += YEARS_PER_SEC*timeScale*dt;          // real sim-time elapsed
     _clockT += dt; if(_clockT>=0.25){ _clockT=0; updateClock(); }
   }
-  updateEvapTails(playing ? YEARS_PER_SEC*timeScale*dt : 0);
+  lastSimDtYears = playing ? YEARS_PER_SEC*timeScale*dt : 0;
+  updateEvapTails(lastSimDtYears);
+  updateImpacts(dt);                          // wall-clock: strikes land even while paused
 
-  // focus tween
-  if(tween.active){
-    tween.t=Math.min(1, tween.t + dt/0.9);
-    const e=1-Math.pow(1-tween.t,3);
-    const bp=worldPos(tween.body);
-    const desiredTarget=bp.clone();
-    const dir=tween.fromCam.clone().sub(tween.fromTarget).normalize();
-    const desiredCam=bp.clone().add(dir.multiplyScalar(tween.dist));
-    controls.target.lerpVectors(tween.fromTarget, desiredTarget, e);
-    camera.position.lerpVectors(tween.fromCam, desiredCam, e);
-    if(tween.t>=1){ tween.active=false; follow=tween.body; }
-  } else if(follow){
-    const bp=worldPos(follow);
-    const delta=bp.clone().sub(controls.target);
-    controls.target.add(delta);
-    camera.position.add(delta);
+  if(flying){
+    updateFly(dt);
+  } else {
+    // focus tween
+    if(tween.active){
+      tween.t=Math.min(1, tween.t + dt/0.9);
+      const e=1-Math.pow(1-tween.t,3);
+      const bp=worldPos(tween.body);
+      const desiredTarget=bp.clone();
+      const dir=tween.fromCam.clone().sub(tween.fromTarget).normalize();
+      const desiredCam=bp.clone().add(dir.multiplyScalar(tween.dist));
+      controls.target.lerpVectors(tween.fromTarget, desiredTarget, e);
+      camera.position.lerpVectors(tween.fromCam, desiredCam, e);
+      if(tween.t>=1){ tween.active=false; follow=tween.body; }
+    } else if(follow){
+      const bp=worldPos(follow);
+      const delta=bp.clone().sub(controls.target);
+      controls.target.add(delta);
+      camera.position.add(delta);
+    }
+    controls.update();
   }
-
-  controls.update();
   if(realScale) updateBodySizes();        // true size, floored to a visible dot
-  // adapt the depth range to zoom so close fly-ins to true-scale worlds stay precise
-  const camDist=camera.position.distanceTo(controls.target);
-  const near=Math.max(camDist*0.002, 0.0002), far=camDist+30000;
+  // adapt the depth range to zoom (nearest body while flying, orbit target otherwise)
+  const refDist = flying ? nearestBodyDist() : camera.position.distanceTo(controls.target);
+  const near=Math.max(refDist*0.002, 0.0002), far=refDist+30000;
   if(camera.near!==near || camera.far!==far){ camera.near=near; camera.far=far; camera.updateProjectionMatrix(); }
   renderer.render(scene,camera);
   if(showLabels) updateLabels();
@@ -803,7 +2654,7 @@ function updateBodySizes(){
     const d = camera.position.distanceTo(_szPos);
     const target = Math.max(realRadiusScene(rec.data.radiusKm)*sizeMult, d*f);   // max(real, dot-floor)
     if(rec.data.kind==='star') starGroup.scale.setScalar(target/STAR_R_COMPRESS);
-    else rec.mesh.scale.setScalar(target/rec.radius);
+    else rec.mesh.scale.setScalar(target/rec.radius*(rec.puffK||1));
   }
 }
 
@@ -818,9 +2669,9 @@ function ensureLabels(){
   for(const rec of bodies){
     if(labelEls[rec.data.key]) continue;
     const el=document.createElement('div');
-    el.className='lbl '+(rec.data.parent==='ra'||rec.data.kind==='star'?'major':'');
+    el.className='lbl '+(rec.data.parent===DS.STAR.key||rec.data.kind==='star'?'major':'');
     if(rec.data.kind==='star') el.className='lbl star';
-    el.textContent=rec.data.name;
+    el.textContent=locName(rec.data);
     el.style.color = '#'+new THREE.Color(rec.data.color||0xcfe0ff).getHexString();
     if(rec.data.kind==='star') el.style.color='#ffd98a';
     el.addEventListener('click',()=>focusBody(rec.data.key,true));
@@ -838,8 +2689,8 @@ function updateLabels(){
     const dist=camPos.distanceTo(wp);
     c2.copy(wp).project(camera);
     const onscreen = c2.z<1 && c2.x>-1.1 && c2.x<1.1 && c2.y>-1.1 && c2.y<1.1;
-    // declutter: hide minor moons when far
-    const minor = !(rec.data.parent==='ra'||rec.data.kind==='star');
+    // declutter: hide minor moons when far (a liberated moon is a planet now — keep its label)
+    const minor = !(rec.data.parent===DS.STAR.key||rec.data.kind==='star'||rec.helio);
     let show = onscreen;
     if(minor && dist>(realScale?1100:620)) show=false;
     if(!show){ el.style.display='none'; continue; }
@@ -858,19 +2709,43 @@ const tip=document.getElementById('tip');
 
 function setupInteraction(){
   const dom=renderer.domElement;
-  let downX=0,downY=0,moved=false;
-  dom.addEventListener('pointerdown',e=>{downX=e.clientX;downY=e.clientY;moved=false;
+  let downX=0,downY=0,moved=false,pdown=false,lastX=0,lastY=0;
+  dom.addEventListener('pointerdown',e=>{ pdown=true; downX=lastX=e.clientX; downY=lastY=e.clientY; moved=false;
+    if(document.activeElement&&document.activeElement.tagName==='INPUT') document.activeElement.blur(); // free keys for flight
+    if(flying){ try{ dom.setPointerCapture(e.pointerId); }catch(_){} }   // keep look-drag alive off-canvas
+    if(!flying && impacting && impWeapon==='laser' && e.button===0){     // press-and-hold (left button) on a world = burn
+      const h=pickHit(e);
+      if(h){ const rec=bodies.find(b=>b.data.key===h.object.userData.bodyKey); if(rec) startBeam(rec,e); }
+    }
     document.getElementById('nav').classList.remove('open');});
   dom.addEventListener('pointermove',e=>{
     if(Math.abs(e.clientX-downX)>4||Math.abs(e.clientY-downY)>4) moved=true;
-    hover(e);
+    if(flying){ if(pdown) flyLook(e.clientX-lastX, e.clientY-lastY); lastX=e.clientX; lastY=e.clientY; }
+    else {
+      if(impBeam){                       // drag the beam Universe-Sandbox style: it follows the pointer
+        const r=dom.getBoundingClientRect();
+        mouse.x=((e.clientX-r.left)/r.width)*2-1; mouse.y=-((e.clientY-r.top)/r.height)*2+1;
+        impRC.setFromCamera(mouse,camera);
+        impBeam.origin.copy(impRC.ray.origin); impBeam.dir.copy(impRC.ray.direction);
+      }
+      hover(e);
+    }
   });
-  dom.addEventListener('pointerup',e=>{
+  dom.addEventListener('pointerup',e=>{ pdown=false;
+    if(impBeam){ stopBeam(); return; }         // release = stop the burn (don't also focus/fire)
     if(moved) return;
-    const hit=pick(e);
-    if(hit){ focusBody(hit,true); }
+    if(flying){ setFlyTarget(pickNear(e)); }   // tap a world (tiny dots too) to target it
+    else if(impacting){                        // impact mode: a left-click strikes instead of focusing
+      if(impWeapon==='asteroid' && e.button===0){
+        const h=pickHit(e);
+        if(h){ const rec=bodies.find(b=>b.data.key===h.object.userData.bodyKey); if(rec) launchAsteroid(rec,h); }
+      }
+    }
+    else { const hit=pick(e); if(hit) focusBody(hit,true); }
   });
+  dom.addEventListener('pointercancel',()=>{ pdown=false; stopBeam(); });
   dom.addEventListener('pointerleave',()=>{tip.style.opacity=0;});
+  window.addEventListener('wheel',e=>{ if(flying){ e.preventDefault(); adjustThrottle(e.deltaY<0?4:-4); } },{passive:false});
 
   document.getElementById('play').onclick=togglePlay;
   document.getElementById('speed').oninput=e=>setSpeed(+e.target.value);
@@ -884,6 +2759,15 @@ function setupInteraction(){
     if(APP.currentData && document.getElementById('info').classList.contains('open')) openInfo(APP.currentData); }; }
   updateTextUI();
   const tls=document.getElementById('t-tails'); if(tls) tls.onclick=toggleTails;
+  const sysb=document.getElementById('t-system');
+  if(sysb){
+    sysb.innerHTML = T('sys-change');                 // reopens the selection screen
+    sysb.onclick=()=>showChooser();
+  }
+  const sx=document.getElementById('t-sfx');
+  if(sx){ sx.onclick=toggleSfx;
+    try{ sfxOn=localStorage.getItem('ra-sfx')!=='0'; }catch(_){ sfxOn=true; }   // on by default
+    sx.classList.toggle('on',sfxOn); }
   document.getElementById('t-orbits').onclick=function(){ showOrbits=!showOrbits; this.classList.toggle('on',showOrbits);
     for(const b of bodies) if(b.orbitLine) b.orbitLine.visible=showOrbits; };
   document.getElementById('t-labels').onclick=function(){ showLabels=!showLabels; this.classList.toggle('on',showLabels);
@@ -899,6 +2783,49 @@ function setupInteraction(){
   const navbtn=document.getElementById('navbtn');
   if(navbtn) navbtn.onclick=()=>document.getElementById('nav').classList.toggle('open');
 
+  // --- impact lab controls ---
+  const impBtn=document.getElementById('t-impact'); if(impBtn) impBtn.onclick=toggleImpact;
+  const impW=document.getElementById('imp-weapon');
+  if(impW) impW.onclick=()=>{ impWeapon=impWeapon==='asteroid'?'laser':'asteroid'; stopBeam(); updateImpactUI(); };
+  const impM=document.getElementById('imp-mat');
+  if(impM) impM.onclick=()=>{ impMatI=(impMatI+1)%IMP_MATS.length; updateImpactUI(); };
+  for(const id of ['imp-dia','imp-spd','imp-pow']){
+    const el=document.getElementById(id); if(el) el.oninput=updateImpactUI;
+  }
+  const impH=document.getElementById('imp-heal'); if(impH) impH.onclick=impHeal;
+  const impX=document.getElementById('imp-exit'); if(impX) impX.onclick=exitImpact;
+  window.addEventListener('keydown',e=>{ if(e.code==='Escape'&&impacting&&!flying) exitImpact(); });
+
+  // --- free-roam flight controls ---
+  const flyBtn=document.getElementById('t-fly'); if(flyBtn) flyBtn.onclick=toggleFly;
+  const fm=document.getElementById('fly-model'); if(fm) fm.onclick=cycleFlyModel;
+  const fa=document.getElementById('fly-auto'); if(fa) fa.onclick=toggleAutoSpeed;
+  const gt=document.getElementById('fly-goto'); if(gt) gt.onclick=flyGoToTarget;
+  const fo=document.getElementById('fly-orient'); if(fo) fo.onclick=()=>{ autoOrient=!autoOrient; updateAutoOrientUI(); };
+  const ff=document.getElementById('fly-follow'); if(ff) ff.onclick=toggleFollow;
+  const fbk=document.getElementById('fly-brake'); if(fbk) fbk.onclick=flyBrake;
+  const fex=document.getElementById('fly-exit'); if(fex) fex.onclick=exitFly;
+  const thr=document.getElementById('throttle'); if(thr) thr.oninput=e=>setThrottleV(+e.target.value);
+  setThrottleV(0);
+  const holdBtn=(id,sign)=>{ const b=document.getElementById(id); if(!b) return;
+    const dn=e=>{ e.preventDefault(); flyThrust=sign; }, up=()=>{ flyThrust=0; };
+    b.addEventListener('pointerdown',dn); b.addEventListener('pointerup',up);
+    b.addEventListener('pointerleave',up); b.addEventListener('pointercancel',up); };
+  holdBtn('fly-fwd',1); holdBtn('fly-back',-1);   // touch/desktop thrust (hold)
+  const MOVE=['KeyW','KeyA','KeyS','KeyD','KeyR','KeyC','KeyQ','KeyE','Space','BracketLeft','BracketRight',
+              'ArrowUp','ArrowDown','ArrowLeft','ArrowRight','PageUp','PageDown'];
+  window.addEventListener('keydown',e=>{
+    if(!flying) return;                     // while flying, capture keys even if the slider has focus
+    flyKeys[e.code]=true;
+    if(e.code==='BracketRight') adjustThrottle(4);
+    else if(e.code==='BracketLeft') adjustThrottle(-4);
+    else if(e.code==='KeyG') flyGoToTarget();
+    else if(e.code==='KeyF' && !e.repeat) toggleFollow();   // F = follow the target
+    else if(e.code==='Escape') exitFly();
+    if(MOVE.includes(e.code)) e.preventDefault();   // also stops arrows/Space from moving the slider/buttons
+  });
+  window.addEventListener('keyup',e=>{ flyKeys[e.code]=false; });
+
   // lightbox
   const lb=document.getElementById('lightbox'), lbi=document.getElementById('lightbox-img');
   lb.onclick=()=>lb.classList.remove('open');
@@ -909,24 +2836,60 @@ function setupInteraction(){
   updateClock();
 }
 
-function pick(e){
+function pickHit(e){   // full first intersection (object, point, uv) — uv drives the scar painting
   const r=renderer.domElement.getBoundingClientRect();
   mouse.x=((e.clientX-r.left)/r.width)*2-1;
   mouse.y=-((e.clientY-r.top)/r.height)*2+1;
   ray.setFromCamera(mouse,camera);
   ray.params.Points={threshold:1};
   const hits=ray.intersectObjects(pickables,false);
-  return hits.length? hits[0].object.userData.bodyKey : null;
+  return hits.length? hits[0] : null;
+}
+function pick(e){
+  const h=pickHit(e);
+  return h? h.object.userData.bodyKey : null;
+}
+/* forgiving pick: exact raycast first, else the nearest body within ~34px on screen
+   (real-scale worlds are floored to a few px, so precise ray hits are nearly impossible). */
+const _pp=new THREE.Vector3();
+function pickNear(e){
+  const exact=pick(e); if(exact) return exact;
+  const r=renderer.domElement.getBoundingClientRect();
+  let best=null, bd=34*34;
+  for(const rec of bodies){
+    _pp.copy(worldPosOf(rec)).project(camera);
+    if(_pp.z>1) continue;                                   // behind the camera
+    const sx=r.left+(_pp.x*0.5+0.5)*r.width, sy=r.top+(-_pp.y*0.5+0.5)*r.height;
+    const dd=(sx-e.clientX)**2+(sy-e.clientY)**2;
+    if(dd<bd){ bd=dd; best=rec.data.key; }
+  }
+  return best;
 }
 function hover(e){
   const k=pick(e);
-  renderer.domElement.style.cursor=k?'pointer':'grab';
+  renderer.domElement.style.cursor = impacting ? 'crosshair' : (k?'pointer':'grab');
   if(k){ const rec=bodies.find(b=>b.data.key===k);
-    tip.textContent=rec.data.name; tip.style.left=e.clientX+'px'; tip.style.top=e.clientY+'px'; tip.style.opacity=1;
+    let txt=locName(rec.data);
+    if(impacting && rec){
+      if(impImmune(rec)) txt+=T('imp-immune');
+      else if(rec.destroyed) txt+=T('imp-destroyed');
+      else{
+        const E=impWeapon==='asteroid'?impKE():impPowW;
+        const pct=E/impBindingJ(rec)*100;
+        const lbl=impWeapon==='asteroid'?T('imp-strike'):T('imp-beam');
+        txt+=' · '+lbl+' ≈ '+(pct>=100?T('imp-binding-over'):(pct<0.01?'<0.01':''+(+pct.toPrecision(2)))+T('imp-binding-of'));
+        if(impWeapon==='asteroid'){
+          const pd=impMeltPoolDeg(rec,E);    // preview the lava sea this rock would leave
+          if(pd>0.5) txt+=T('imp-melts-sea').replace('{km}',Math.round(pd*2/57.2958*(rec.data.radiusKm||1000)).toLocaleString());
+        }
+        txt+=impTierTxt(rec);
+      }
+    }
+    tip.textContent=txt; tip.style.left=e.clientX+'px'; tip.style.top=e.clientY+'px'; tip.style.opacity=1;
   } else tip.style.opacity=0;
 }
 
-function togglePlay(){ playing=!playing; document.getElementById('play').innerHTML=playing?'⏸ Pause':'▶ Play'; }
+function togglePlay(){ playing=!playing; document.getElementById('play').innerHTML=playing?T('pause'):T('play'); }
 function setSpeed(v){ // 0..100 -> real time-rate (sim years advanced per real second), logarithmic
   const yps = Math.exp( Math.log(RATE_MIN_YPS) + (Math.log(RATE_MAX_YPS)-Math.log(RATE_MIN_YPS))*(v/100) );
   timeScale = yps / YEARS_PER_SEC;          // motion advances exactly `yps` sim-years per real second
@@ -935,20 +2898,20 @@ function setSpeed(v){ // 0..100 -> real time-rate (sim years advanced per real s
 /* speed readout in real time units: "real-time", "45 s/s", "12 min/s", "6 hr/s", "3 days/s", "2 mo/s", "1.4 yr/s" */
 function fmtRate(yps){
   const s = yps*SEC_PER_YEAR;               // sim seconds advanced per real second
-  if(s>0.7 && s<1.5) return 'real-time';
-  if(yps>=1)            return (yps<10?yps.toFixed(2):yps.toFixed(0))+' yr/s';
-  const mo=yps*12;     if(mo>=1) return mo.toFixed(1)+' mo/s';
-  const d=yps*365.25;  if(d>=1)  return (d<10?d.toFixed(1):d.toFixed(0))+' days/s';
-  const h=d*24;        if(h>=1)  return (h<10?h.toFixed(1):h.toFixed(0))+' hr/s';
-  const mi=h*60;       if(mi>=1) return mi.toFixed(0)+' min/s';
-  return (mi*60).toFixed(0)+' s/s';
+  if(s>0.7 && s<1.5) return T('rt');
+  if(yps>=1)            return (yps<10?yps.toFixed(2):yps.toFixed(0))+' '+T('u-yr');
+  const mo=yps*12;     if(mo>=1) return mo.toFixed(1)+' '+T('u-mo');
+  const d=yps*365.25;  if(d>=1)  return (d<10?d.toFixed(1):d.toFixed(0))+' '+T('u-day');
+  const h=d*24;        if(h>=1)  return (h<10?h.toFixed(1):h.toFixed(0))+' '+T('u-hr');
+  const mi=h*60;       if(mi>=1) return mi.toFixed(0)+' '+T('u-min');
+  return (mi*60).toFixed(0)+' '+T('u-s');
 }
 function fmtElapsed(yr){
-  if(yr>=1)            return (yr<100?yr.toFixed(1):yr.toFixed(0))+' yr';
-  const d=yr*365.25;   if(d>=1)  return (d<10?d.toFixed(1):d.toFixed(0))+' days';
-  const h=d*24;        if(h>=1)  return h.toFixed(1)+' hr';
-  const mi=h*60;       if(mi>=1) return mi.toFixed(0)+' min';
-  return (mi*60).toFixed(0)+' s';
+  if(yr>=1)            return (yr<100?yr.toFixed(1):yr.toFixed(0))+' '+T('e-yr');
+  const d=yr*365.25;   if(d>=1)  return (d<10?d.toFixed(1):d.toFixed(0))+' '+T('e-day');
+  const h=d*24;        if(h>=1)  return h.toFixed(1)+' '+T('e-hr');
+  const mi=h*60;       if(mi>=1) return mi.toFixed(0)+' '+T('e-min');
+  return (mi*60).toFixed(0)+' '+T('e-s');
 }
 function updateClock(){ const el=document.getElementById('elapsed'); if(el) el.textContent='⏱ '+fmtElapsed(elapsedYears); }
 function setSize(v){
@@ -988,6 +2951,191 @@ function focusBody(key, openPanel){
 }
 
 /* ============================================================
+   Free-roam flight (Celestia / Space-Engine style) — you ARE the camera
+   ============================================================ */
+const FLY_LOOK_SENS = 0.0042;        // radians of look per pixel dragged
+const _fa=new THREE.Vector3(), _fb=new THREE.Vector3(), _fc=new THREE.Vector3(), _fq=new THREE.Quaternion();
+
+function toggleFly(){ flying ? exitFly() : enterFly(); }
+function enterFly(){
+  if(flying) return;
+  if(impacting) exitImpact();                 // fly's drag-to-look conflicts with hold-to-lase
+  if(!realScale) setScaleMode(true);          // flight is a real-scale experience
+  flying=true; tween.active=false; follow=null; controls.enabled=false;
+  flyEuler.setFromQuaternion(camera.quaternion,'YXZ'); flyEuler.z=0;
+  flyVel.set(0,0,0);
+  document.getElementById('flyhud').classList.add('on');
+  const b=document.getElementById('t-fly'); if(b) b.classList.add('on');
+  updateFlyModelUI(); updateAutoOrientUI(); updateAutoSpeedUI(); updateFollowUI(); updateFlyHUD();
+}
+function exitFly(){
+  if(!flying) return;
+  flying=false; flyFollow=null; flyGoto=null; controls.enabled=true;
+  _fa.set(0,0,-1).applyQuaternion(camera.quaternion);     // park the orbit pivot ahead of view
+  controls.target.copy(camera.position).addScaledVector(_fa, 20);
+  document.getElementById('flyhud').classList.remove('on');
+  const b=document.getElementById('t-fly'); if(b) b.classList.remove('on');
+}
+function flyLook(dx,dy){
+  autoOrient=false; updateAutoOrientUI();
+  flyEuler.y -= dx*FLY_LOOK_SENS; flyEuler.x -= dy*FLY_LOOK_SENS;
+  const lim=Math.PI/2-0.01; flyEuler.x=Math.max(-lim,Math.min(lim,flyEuler.x));
+}
+function cycleFlyModel(){
+  flyModel = flyModel==='cruise'?'newton':flyModel==='newton'?'flycam':'cruise';
+  if(flyModel!=='newton') flyVel.set(0,0,0);
+  updateFlyModelUI();
+}
+function updateFlyModelUI(){ const b=document.getElementById('fly-model');
+  if(b) b.textContent = flyModel==='cruise'?'🛟 Cruise':flyModel==='newton'?'🚀 Newtonian':'🎮 Flycam'; }
+function updateAutoOrientUI(){ const b=document.getElementById('fly-orient'); if(b) b.classList.toggle('on',autoOrient); }
+function toggleFollow(){                       // F: lock onto the target and co-move as it orbits
+  if(flyFollow) flyFollow=null;
+  else if(flyTarget){ flyFollow=flyTarget; _flyPrevTarget.copy(worldPosOf(flyTarget)); }
+  updateFollowUI(); updateFlyHUD();
+}
+function updateFollowUI(){ const b=document.getElementById('fly-follow'); if(b) b.classList.toggle('on',!!flyFollow); }
+function toggleAutoSpeed(){ flyAutoSpeed=!flyAutoSpeed; updateAutoSpeedUI();
+  const sl=document.getElementById('throttle'); setThrottleV(sl?+sl.value:0); }   // re-resolve speed for the new mode
+function updateAutoSpeedUI(){ const b=document.getElementById('fly-auto');
+  if(b){ b.classList.toggle('on',flyAutoSpeed); b.textContent = flyAutoSpeed?'⚡ Auto':'⚙ Manual';
+    b.title = flyAutoSpeed?'Speed auto-scales to nearby bodies — click for manual (uncapped) speed'
+                          :'Manual speed (any value) — click for auto-scaling'; } }
+function flyBrake(){ flyVel.set(0,0,0); }
+function setFlyTarget(key){
+  const rec=key&&bodies.find(b=>b.data.key===key);
+  if(rec){
+    if(flyTarget===rec){ flyGoToTarget(); }   // tap the current target again = fly there
+    else { flyTarget=rec; selected=key; setActiveNav(key); }
+  }
+  updateFlyHUD();
+}
+function flyGoToTarget(){
+  if(!flyTarget) return;
+  flyGoto={ rec:flyTarget, t:0, dur:1.8, fromPos:camera.position.clone(), fromQuat:camera.quaternion.clone() };
+}
+function gotoFrameDist(rec){ return Math.max(realRadiusScene(rec.data.radiusKm)*Math.max(sizeMult,1)*4, 0.01); }
+function lookQuatAt(tp){ _fq.copy(camera.quaternion); camera.up.set(0,1,0); camera.lookAt(tp);
+  const q=camera.quaternion.clone(); camera.quaternion.copy(_fq); return q; }
+
+function setThrottleV(v){               // slider 0..100 -> throttle fraction; 0 = stopped
+  v=Math.max(0,Math.min(100,v));
+  throttleFrac = v/100;
+  const sl=document.getElementById('throttle'); if(sl && +sl.value!==v) sl.value=v;
+  throttleKms = flyTargetKms();          // resolve to a real km/s for the readout
+  updateFlyHUD();
+}
+function adjustThrottle(d){ const sl=document.getElementById('throttle'); if(sl) setThrottleV(+sl.value+d); }
+/* full-throttle speed for the CURRENT position: scales with the gap to the nearest body so one
+   slider works from a low pass over a moon to a superluminal deep-space cruise. */
+function flyFullKms(){
+  let best=1e12;
+  for(const rec of bodies){
+    const r=realRadiusScene(rec.data.radiusKm)*Math.max(sizeMult,1);
+    const d=camera.position.distanceTo(worldPosOf(rec))-r;
+    if(d<best) best=d;
+  }
+  best=Math.max(best,1e-5);
+  return Math.min(Math.max(best*REACH_RATE*KM_PER_UNIT, FLY_FLOOR_KMS), FLY_CAP_KMS);
+}
+/* throttle fraction -> real km/s. AUTO = context-relative, curved (f^2) for fine control;
+   MANUAL = absolute log map over an uncapped range so the user can pick any speed. */
+function flyTargetKms(){
+  if(throttleFrac<=0) return 0;
+  return flyAutoSpeed ? flyFullKms()*throttleFrac*throttleFrac
+                      : FLY_MANUAL_MIN*Math.pow(FLY_MANUAL_MAX/FLY_MANUAL_MIN, throttleFrac);
+}
+
+function fmtSpeed(kms){
+  if(kms<1) return '0 km/s';
+  if(kms<30000) return Math.round(kms).toLocaleString()+' km/s';
+  const c=kms/C_KMS; return (c<10?c.toFixed(2):c<100?c.toFixed(1):Math.round(c).toLocaleString())+' c';
+}
+function fmtTime(s){
+  if(!isFinite(s)||s<0) return '—';
+  if(s<90) return Math.round(s)+' s';
+  if(s<5400) return (s/60).toFixed(1)+' min';
+  if(s<172800) return (s/3600).toFixed(1)+' h';
+  if(s<5256000) return (s/86400).toFixed(1)+' d';
+  return (s/31557600).toFixed(1)+' yr';
+}
+function fmtDist(km){
+  if(km<1e6) return Math.round(km).toLocaleString()+' km';
+  const au=km/KM_PER_AU; return au<0.01?(km/1e6).toFixed(2)+' M km':au.toFixed(au<10?3:1)+' AU';
+}
+function updateFlyHUD(){
+  if(!flying) return;
+  // show the throttle set-speed (responds to the slider) with the live speed if it differs
+  const sp=document.getElementById('fly-speed');
+  if(sp){ const act=flyVel.length()*KM_PER_UNIT;
+    sp.textContent = (Math.abs(act-throttleKms)/(throttleKms||1) > 0.15 && act>0)
+      ? fmtSpeed(act) : fmtSpeed(throttleKms); }
+  const tg=document.getElementById('fly-target'), eta=document.getElementById('fly-eta');
+  if(flyTarget){
+    const tp=worldPosOf(flyTarget), rangeKm=camera.position.distanceTo(tp)*KM_PER_UNIT;
+    if(tg) tg.textContent='◎ '+locName(flyTarget.data)+' · '+fmtDist(rangeKm);
+    _fa.copy(tp).sub(camera.position).normalize();
+    const closeKms=flyVel.dot(_fa)*KM_PER_UNIT;
+    if(eta) eta.textContent = 'ETA '+(closeKms>1?fmtTime(rangeKm/closeKms):'—');
+  } else { if(tg) tg.textContent=T('fly-notarget'); if(eta) eta.textContent=''; }
+}
+function nearestBodyDist(){
+  let d=1e12; for(const rec of bodies){ const dd=camera.position.distanceToSquared(worldPosOf(rec)); if(dd<d) d=dd; }
+  return Math.max(Math.sqrt(d), 0.01);
+}
+
+/* per-frame flight update (called from animate while flying) */
+function updateFly(dt){
+  if(flyKeys['KeyQ']) flyEuler.z += dt*1.2;
+  if(flyKeys['KeyE']) flyEuler.z -= dt*1.2;
+
+  // cinematic Go-to auto-pilot
+  if(flyGoto){
+    flyGoto.t=Math.min(1, flyGoto.t+dt/flyGoto.dur); const e=1-Math.pow(1-flyGoto.t,3);
+    const tp=worldPosOf(flyGoto.rec);
+    _fa.copy(flyGoto.fromPos).sub(tp); if(_fa.lengthSq()<1e-9) _fa.set(0,0,1); _fa.normalize();
+    _fb.copy(tp).addScaledVector(_fa, gotoFrameDist(flyGoto.rec));
+    camera.position.lerpVectors(flyGoto.fromPos, _fb, e);
+    camera.quaternion.slerpQuaternions(flyGoto.fromQuat, lookQuatAt(tp), e);
+    if(flyGoto.t>=1){ flyFollow=flyGoto.rec; flyTarget=flyGoto.rec; _flyPrevTarget.copy(tp);
+      flyEuler.setFromQuaternion(camera.quaternion,'YXZ'); flyGoto=null; }
+    updateFlyHUD(); return;
+  }
+
+  // follow: co-move with a body as it orbits
+  if(flyFollow){ const tp=worldPosOf(flyFollow); camera.position.add(_fa.copy(tp).sub(_flyPrevTarget)); _flyPrevTarget.copy(tp); }
+
+  // orientation
+  if(autoOrient && flyTarget){
+    camera.quaternion.slerp(lookQuatAt(worldPosOf(flyTarget)), Math.min(1,dt*3));
+    flyEuler.setFromQuaternion(camera.quaternion,'YXZ');
+  } else camera.quaternion.setFromEuler(flyEuler);
+
+  // movement: forward / right / up of current view
+  _fa.set(0,0,-1).applyQuaternion(camera.quaternion);
+  _fb.set(1,0,0).applyQuaternion(camera.quaternion);
+  _fc.set(0,1,0).applyQuaternion(camera.quaternion);
+  const fwd=(flyKeys['KeyW']||flyKeys['ArrowUp']?1:0)-(flyKeys['KeyS']||flyKeys['ArrowDown']?1:0)+flyThrust;       // W/S, ↑/↓, ▲/▼
+  const str=(flyKeys['KeyD']||flyKeys['ArrowRight']?1:0)-(flyKeys['KeyA']||flyKeys['ArrowLeft']?1:0);             // A/D, ←/→ strafe
+  const ver=((flyKeys['PageUp']||flyKeys['KeyR']||flyKeys['Space'])?1:0)-((flyKeys['PageDown']||flyKeys['KeyC'])?1:0); // up/down (F is now follow)
+  // resolve slider -> real km/s (auto or manual); pressing a move key always yields motion
+  throttleKms = flyTargetKms();
+  if(fwd||str||ver) throttleKms=Math.max(throttleKms, flyFullKms()*FLY_KEY_FLOOR);
+  const spd=kmsToUnits(throttleKms)*((flyKeys['ShiftLeft']||flyKeys['ShiftRight'])?6:1);
+  if(flyModel==='cruise'){               // coast forward at throttle; ▲/W boost, ▼/S brake, A/D/R/F strafe
+    flyVel.copy(_fa).multiplyScalar(spd*(1+fwd)).addScaledVector(_fb,str*spd).addScaledVector(_fc,ver*spd);
+  } else if(flyModel==='flycam'){        // move only while thrust held (▲/▼ or keys)
+    _fa.multiplyScalar(fwd).addScaledVector(_fb,str).addScaledVector(_fc,ver);
+    if(_fa.lengthSq()>0) flyVel.copy(_fa.normalize()).multiplyScalar(spd); else flyVel.set(0,0,0);
+  } else {                                // newton: thrust accelerates, then drift
+    _fa.multiplyScalar(fwd).addScaledVector(_fb,str).addScaledVector(_fc,ver);
+    if(_fa.lengthSq()>0) flyVel.addScaledVector(_fa.normalize(), spd*dt);
+  }
+  camera.position.addScaledVector(flyVel, dt);
+  updateFlyHUD();
+}
+
+/* ============================================================
    Navigator + info panel
    ============================================================ */
 function navItem(data, sub){
@@ -995,58 +3143,94 @@ function navItem(data, sub){
   el.className='navitem'+(sub?' sub':'');
   el.dataset.key=data.key;
   const col='#'+new THREE.Color(data.color||0xcccccc).getHexString();
-  el.innerHTML=`<span class="dot" style="color:${col}"></span><span>${data.name}</span>`+
-    (data.life?`<span class="tag" title="harbours life">✦&nbsp;${data.life}</span>`:'');
+  el.innerHTML=`<span class="dot" style="color:${col}"></span><span>${locName(data)}</span>`+
+    (data.life?`<span class="tag" title="${T('life-title')}">✦&nbsp;${T('life-'+data.life)}</span>`:'');
   el.onclick=()=>focusBody(data.key,true);
   return el;
 }
 function buildNav(){
   const nav=document.getElementById('nav');
-  const h=document.createElement('h3'); h.textContent='Ra System'; nav.appendChild(h);
-  nav.appendChild(navItem(STAR));
-  for(const p of PLANETS){
+  const h=document.createElement('h3'); h.textContent=SYS==='sol'?T('nav-sol'):T('nav-ra'); nav.appendChild(h);
+  nav.appendChild(navItem(DS.STAR));
+  for(const p of DS.PLANETS){
     nav.appendChild(navItem(p));
-    for(const m of MOONS.filter(x=>x.parent===p.key)) nav.appendChild(navItem(m,true));
+    for(const m of DS.MOONS.filter(x=>x.parent===p.key)) nav.appendChild(navItem(m,true));
   }
-  const h2=document.createElement('h3'); h2.textContent='Horus subsystem'; nav.appendChild(h2);
-  nav.appendChild(navItem(HORUS));
-  for(const m of HORUS_MOONS) nav.appendChild(navItem(m,true));
+  if(DS.HORUS){
+    const h2=document.createElement('h3'); h2.textContent=T('nav-horus'); nav.appendChild(h2);
+    nav.appendChild(navItem(DS.HORUS));
+    for(const m of DS.HORUS_MOONS) nav.appendChild(navItem(m,true));
+  }
 }
 function setActiveNav(key){
   document.querySelectorAll('.navitem').forEach(el=>el.classList.toggle('active', el.dataset.key===key));
 }
+/* sidebar badge: a destroyed world swaps its ✦ life tag for a red ☠ one */
+function updateNavStatus(rec){
+  const el=document.querySelector('.navitem[data-key="'+rec.data.key+'"]'); if(!el) return;
+  let tag=el.querySelector('.tag');
+  if(rec.destroyed){
+    if(!tag){ tag=document.createElement('span'); tag.className='tag'; el.appendChild(tag); }
+    tag.className='tag dead'; tag.removeAttribute('title');
+    tag.innerHTML='☠&nbsp;'+T('nav-destroyed');
+  } else if(rec.data.life){
+    if(!tag){ tag=document.createElement('span'); el.appendChild(tag); }
+    tag.className='tag'; tag.title=T('life-title');
+    tag.innerHTML='✦&nbsp;'+T('life-'+rec.data.life);
+  } else if(tag) tag.remove();
+}
 
 function typeLabelFor(d){
-  if(d.kind==='star') return 'Star';
-  if(d.kind==='browndwarf') return 'Brown dwarf';
-  if(d.parent && d.parent!=='ra') return 'Moon';
-  return 'Planet';
+  if(d.kind==='star') return T('type-star');
+  if(d.kind==='browndwarf') return T('type-bd');
+  if(d.parent && d.parent!==DS.STAR.key) return T('type-moon');
+  return T('type-planet');
 }
 function openInfo(d){
   APP.currentData=d;
+  // a destroyed world (impact lab) shows its debris-field epitaph instead
+  const drec=bodies.find(b=>b.data.key===d.key);
+  if(drec && drec.destroyed) return openInfoDestroyed(drec);
   // the author's word-for-word text, where the source document has it
-  const verbatim = (typeof DESCRIPTIONS_VERBATIM!=='undefined') ? DESCRIPTIONS_VERBATIM[d.key] : null;
+  // (in Slovak mode a natural translation of that text)
+  const verbatim = locVerbatim(d.key);
   // author's-text edition shows only the author's words, so hide my own tagline there
   const authorOnly = USE_VERBATIM && !!verbatim;
   document.getElementById('i-type').textContent=typeLabelFor(d);
-  document.getElementById('i-name').innerHTML=d.name+(d.alt?`<span>${d.alt}</span>`:'');
+  document.getElementById('i-name').innerHTML=locName(d)+(d.alt?`<span>${d.alt}</span>`:'');
   // tagline is my own line — hide it only when showing the author's own words alone
   const tagEl=document.getElementById('i-tag');
-  tagEl.textContent = authorOnly ? '' : (d.tagline||'');
+  tagEl.textContent = authorOnly ? '' : (locTagline(d)||'');
   tagEl.style.display = authorOnly ? 'none' : 'block';
   // gallery
   const g=document.getElementById('i-gallery'); g.innerHTML='';
-  (d.images||[]).forEach(([file,cap])=>{
+  (d.images||[]).forEach(([file,cap],i)=>{
     const fig=document.createElement('figure');
     const img=new Image(); img.src='assets/img/'+file; img.alt=cap; img.loading='lazy';
     img.onclick=()=>APP.openLightbox(img.src);
-    const fc=document.createElement('figcaption'); fc.textContent=cap;
+    const fc=document.createElement('figcaption'); fc.textContent=locCaption(d,i,cap);
     fig.appendChild(img); fig.appendChild(fc); g.appendChild(fig);
   });
   // stats
   const t=document.getElementById('i-stats'); t.innerHTML='';
-  (d.stats||[]).forEach(([k,v])=>{ const tr=document.createElement('tr');
+  (locStats(d)||[]).forEach(([k,v])=>{ const tr=document.createElement('tr');
     tr.innerHTML=`<td>${k}</td><td>${v}</td>`; t.appendChild(tr); });
+  // an impact-nudged orbit overrides the book values — show the live elements
+  const prec=bodies.find(b=>b.data.key===d.key);
+  if(prec && prec.orbitPerturbed && !prec.destroyed){
+    const aAU=prec.helio?(prec.helioA!=null?prec.helioA:prec.data.dist):(prec._physA!=null?prec._physA:prec.data.dist);
+    const val=prec.helio
+      ? (+aAU.toPrecision(4))+' AU · e='+(+prec.e.toPrecision(3))+' · '+(+prec.period.toPrecision(3))+' '+T('e-yr')
+      : Math.round(aAU*1.496e8).toLocaleString()+' km · e='+(+prec.e.toPrecision(3));
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td>⚠ '+T('st-orbit-now')+'</td><td>'+val+'</td>'; t.appendChild(tr);
+  }
+  // mass boiled off by superheating overrides the book value — show what's left
+  if(prec && !prec.destroyed && impMassLostKg(prec)/impBodyMassKg0(prec)>0.001){
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td>⚠ '+T('st-mass-now')+'</td><td id="i-mass-now">'+impMassNowTxt(prec)+'</td>';
+    t.appendChild(tr);
+  }
   // description
   const ds=document.getElementById('i-desc'); ds.innerHTML='';
   const addParas=(text)=>{ (text||'').split('\n\n').forEach(par=>{ if(!par.trim())return;
@@ -1059,25 +3243,54 @@ function openInfo(d){
     else {
       const note=document.createElement('p');
       note.style.cssText='font-style:italic;color:#8ea2c0;font-size:12px';
-      note.textContent='(No description in the source document yet — summary shown.)';
+      note.textContent=T('no-desc');
       ds.appendChild(note);
-      addParas(d.desc);
+      addParas(locDesc(d));
     }
   } else {
     // default edition: my short summary, then the author's verbatim text beneath it
-    addParas(d.desc);
-    if(verbatim){ addSource("From the source — author's text"); addParas(verbatim); }
+    addParas(locDesc(d));
+    if(verbatim){ addSource(T('from-source')); addParas(verbatim); }
   }
   document.getElementById('info').classList.add('open');
   syncInfoBtn();
 }
 function syncInfoBtn(){ const ib=document.getElementById('infobtn');
   if(ib) ib.classList.toggle('on', document.getElementById('info').classList.contains('open')); }
+/* info panel for a world destroyed in the impact lab */
+function openInfoDestroyed(rec){
+  const d=rec.data;
+  document.getElementById('i-type').textContent=T('debris-type');
+  document.getElementById('i-name').innerHTML=locName(d)+'<span>'+T('debris-name-span')+'</span>';
+  const tagEl=document.getElementById('i-tag');
+  tagEl.textContent=T('debris-tag'); tagEl.style.display='block';
+  document.getElementById('i-gallery').innerHTML='';
+  const t=document.getElementById('i-stats'); t.innerHTML='';
+  [[T('st-status'),T('st-destroyed')],
+   [T('st-cause'),T('st-cause-v')],
+   [T('st-eabs'), (rec.dmgJ||0).toExponential(2).replace('e+','e')+' J'],
+   [T('st-ebind'), impBindingJ(rec).toExponential(2).replace('e+','e')+' J'],
+   [T('st-ring'), T('st-ring-v')]
+  ].forEach(([k,v])=>{ const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${k}</td><td>${v}</td>`; t.appendChild(tr); });
+  const ds=document.getElementById('i-desc'); ds.innerHTML='';
+  const p=document.createElement('p');
+  p.textContent=T('debris-epitaph').replace(/\{name\}/g,locName(d));
+  ds.appendChild(p);
+  const hint=document.createElement('p');
+  hint.style.cssText='font-style:italic;color:#8ea2c0;font-size:12px';
+  hint.textContent=T('heal-hint');
+  ds.appendChild(hint);
+  document.getElementById('info').classList.add('open');
+  syncInfoBtn();
+}
+
 function closeInfo(){ document.getElementById('info').classList.remove('open'); setActiveNav(selected); syncInfoBtn(); }
 
 function buildGlossary(){
   const el=document.getElementById('gloss');
-  el.innerHTML=GLOSSARY.map(([k,v])=>`<b>${k}</b> — ${v}`).join('<br>');
+  const gl=(LANG==='sk' && typeof LANG_SK!=='undefined' && (SYS==='sol'?LANG_SK.glossarySol:LANG_SK.glossary))||DS.GLOSSARY;
+  el.innerHTML=gl.map(([k,v])=>`<b>${k}</b> — ${v}`).join('<br>');
 }
 
 function onResize(){
@@ -1085,5 +3298,33 @@ function onResize(){
   renderer.setSize(innerWidth,innerHeight);
 }
 
+/* ---- entry: first-visit shows the system chooser; returning visitors load
+   straight into their saved system. The ⇄ toolbar button reopens the chooser. ---- */
+let _built=false;
+function initApp(){
+  let saved=null; try{ saved=localStorage.getItem('ra-system'); }catch(_){}
+  if(saved==='ra' || saved==='sol'){ applySystem(saved); build(); _built=true; }
+  else showChooser();
+}
+function showChooser(){
+  const ch=document.getElementById('chooser'); if(!ch){ applySystem('ra'); build(); _built=true; return; }
+  // localize the chooser to the saved language before it's shown
+  let lang='en'; try{ if(localStorage.getItem('ra-lang')==='sk') lang='sk'; }catch(_){}
+  const L=(lang==='sk' && typeof LANG_SK!=='undefined') ? LANG_SK.ui : UI_EN;
+  const setTxt=(id,k)=>{ const el=document.getElementById(id); if(el && L[k]!=null) el.innerHTML=L[k]; };
+  setTxt('chooser-title','choose-title'); setTxt('choose-ra-h','choose-ra'); setTxt('choose-ra-sub','choose-ra-sub');
+  setTxt('choose-sol-h','choose-sol'); setTxt('choose-sol-sub','choose-sol-sub');
+  ch.querySelector('[data-sys="ra"]').onclick=()=>pickSystem('ra');
+  ch.querySelector('[data-sys="sol"]').onclick=()=>pickSystem('sol');
+  ch.style.display='flex'; ch.style.opacity='1';
+}
+function pickSystem(sys){
+  try{ localStorage.setItem('ra-system', sys); }catch(_){}
+  if(_built){ location.hash=''; location.reload(); return; }   // mid-session change → clean rebuild
+  const ch=document.getElementById('chooser');
+  if(ch){ ch.style.opacity='0'; setTimeout(()=>{ ch.style.display='none'; },500); }
+  applySystem(sys); build(); _built=true;
+}
+
 /* go */
-window.addEventListener('DOMContentLoaded', build);
+window.addEventListener('DOMContentLoaded', initApp);

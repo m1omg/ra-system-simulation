@@ -26,6 +26,22 @@
     border-top-color:var(--accent2);border-radius:50%;animation:rot 1s linear infinite}
   @keyframes rot{to{transform:rotate(360deg)}}
 
+  /* ---------- System selection (first visit) ---------- */
+  #chooser{position:fixed;inset:0;background:radial-gradient(circle at 50% 40%,#0b1426,#04060c 70%);
+    display:none;flex-direction:column;align-items:center;justify-content:center;gap:34px;z-index:100;
+    transition:opacity .5s;padding:24px;overflow:hidden}
+  #chooser h2{font-weight:300;letter-spacing:.18em;text-transform:uppercase;font-size:clamp(14px,3.4vw,20px);
+    color:var(--dim);text-align:center}
+  #chooser .choices{display:flex;gap:24px;flex-wrap:wrap;justify-content:center;max-width:820px}
+  #chooser .choice{display:flex;flex-direction:column;gap:10px;align-items:flex-start;text-align:left;
+    background:var(--panel);border:1px solid var(--line2);border-radius:16px;padding:28px 30px;
+    width:340px;max-width:88vw;cursor:pointer;color:var(--txt);font-family:var(--font);
+    transition:transform .15s,border-color .15s,background .15s;box-shadow:0 10px 40px rgba(0,0,0,.5)}
+  #chooser .choice:hover{transform:translateY(-3px);border-color:var(--accent2);background:var(--panel2)}
+  #chooser .choice-h{font-size:22px;font-weight:400;letter-spacing:.02em;color:var(--accent2)}
+  #chooser .choice-sub{font-size:13px;color:var(--dim);line-height:1.4}
+  @media(max-width:560px){ #chooser .choices{gap:14px} #chooser .choice{padding:20px 22px} }
+
   /* ---------- Generic panel ---------- */
   .panel{position:absolute;background:var(--panel);backdrop-filter:blur(10px);
     border:1px solid var(--line);border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,.5)}
@@ -49,6 +65,7 @@
   .navitem.sub .dot{width:8px;height:8px}
   .navitem .tag{margin-left:auto;font-size:9px;color:#7fe6a8;opacity:.9;letter-spacing:.04em;
     background:rgba(80,220,140,.12);border:1px solid rgba(80,220,140,.3);padding:1px 6px;border-radius:10px}
+  .navitem .tag.dead{color:#ff9d8a;background:rgba(255,90,70,.12);border-color:rgba(255,90,70,.35)}
 
   /* ---------- Bottom control bar ---------- */
   #controls{bottom:16px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:14px;
@@ -68,6 +85,30 @@
   .sep{width:1px;height:26px;background:var(--line)}
   #speedval{min-width:66px;text-align:right;color:var(--accent2);font-variant-numeric:tabular-nums}
   .clock{font-size:10.5px;color:var(--dim);letter-spacing:.04em;font-variant-numeric:tabular-nums}
+
+  /* ---------- Free-roam flight HUD ---------- */
+  #flyhud{top:16px;left:50%;transform:translateX(-50%);width:min(470px,92vw);padding:10px 13px;display:none;z-index:26}
+  #flyhud.on{display:flex;flex-direction:column;gap:7px}
+  #flyhud .flyrow{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim)}
+  #flyhud .flyrow b{color:var(--accent2);font-weight:600;letter-spacing:.04em;margin-right:auto}
+  #flyhud label{font-size:10px;text-transform:uppercase;letter-spacing:.08em}
+  #flyhud #throttle{flex:1}
+  #flyhud #fly-speed{min-width:86px;text-align:right;color:var(--accent2);font-variant-numeric:tabular-nums}
+  #flyhud .tgt #fly-target{color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #flyhud .tgt #fly-eta{margin-left:auto;color:var(--accent);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .btn.sm{padding:5px 9px;font-size:11px}
+  #flyhud .hint{font-size:10px;color:var(--dim);opacity:.6;flex-wrap:wrap;line-height:1.5}
+
+  /* ---------- Impact lab (💥) ---------- */
+  #implab{top:16px;left:50%;transform:translateX(-50%);width:min(470px,92vw);padding:10px 13px;display:none;z-index:26}
+  #implab.on{display:flex;flex-direction:column;gap:7px}
+  #implab .improw{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim)}
+  #implab .improw b{color:var(--hot);font-weight:600;letter-spacing:.04em;margin-right:auto}
+  #implab label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;min-width:58px}
+  #implab input[type=range]{flex:1}
+  #implab .val{min-width:84px;text-align:right;color:var(--accent2);font-variant-numeric:tabular-nums;white-space:nowrap}
+  #implab #imp-energy{font-size:11px;color:var(--hot);letter-spacing:.02em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #implab .hint{font-size:10px;color:var(--dim);opacity:.6;flex-wrap:wrap;line-height:1.5}
 
   /* ---------- Info panel ---------- */
   /* slide via transform (not a negative `right`, which would push the page
@@ -198,40 +239,56 @@
 <div id="app"></div>
 <div id="labels"></div>
 
+<div id="chooser">
+  <h2 id="chooser-title">Choose a planetary system</h2>
+  <div class="choices">
+    <button class="choice" data-sys="ra">
+      <span class="choice-h" id="choose-ra-h">✨ The Ra System</span>
+      <span class="choice-sub" id="choose-ra-sub">A fictional world — “Satis v10”</span>
+    </button>
+    <button class="choice" data-sys="sol">
+      <span class="choice-h" id="choose-sol-h">🌍 The Solar System</span>
+      <span class="choice-sub" id="choose-sol-sub">Our home — real planets &amp; moons</span>
+    </button>
+  </div>
+</div>
+
 <div id="loader">
   <h1>RA</h1>
-  <p>Building the planetary system…</p>
+  <p id="loader-sub">Building the planetary system…</p>
   <div class="spin"></div>
 </div>
 
 <div id="title" class="panel">
-  <small>Interactive 3D Simulation</small>
-  <h1>The <b>Ra</b> Planetary System</h1>
+  <small id="title-sub">Interactive 3D Simulation</small>
+  <h1 id="title-h1">The <b>Ra</b> Planetary System</h1>
 </div>
 
 <button id="navbtn" class="btn panel" aria-label="Toggle body list" title="Body list">☰</button>
 <button id="helpbtn" class="btn panel" title="Help & glossary">?</button>
 <button id="infobtn" class="btn panel" title="Show / hide info about the selected world">ⓘ</button>
 <div id="help" class="panel scrollthin">
-  <h4>Navigate</h4>
-  <div class="g"><b>Drag</b> — orbit camera (left or right button)<br><b>Scroll</b> — zoom in / out<br><b>Middle-drag</b> — pan<br><b>Click a world</b> — focus &amp; read about it<br><b>On touch screens</b> — tap focuses; ⓘ (top right) opens the info sheet<br><b>List / labels</b> — jump to any body</div>
-  <h4>About the scale</h4>
-  <div class="g"><b>Real scale</b> (default) places every orbit at its true distance in AU — so Amunet hugs the star and Horus sits far out at 46 AU; zoom out to find Shu and Horus. <b>Compressed</b> (toggle in the bottom bar) squeezes the huge 0.05–46 AU range so the whole system fits on screen at once. Body sizes are exaggerated in both modes (true sizes would be invisible). Real figures are in each world's data panel; orbital <b>speeds</b> follow Kepler's laws.</div>
+  <h4 id="help-nav-h">Navigate</h4>
+  <div class="g" id="help-nav"><b>Drag</b> — orbit camera (left or right button)<br><b>Scroll</b> — zoom in / out<br><b>Middle-drag</b> — pan<br><b>Click a world</b> — focus &amp; read about it<br><b>On touch screens</b> — tap focuses; ⓘ (top right) opens the info sheet<br><b>List / labels</b> — jump to any body</div>
+  <h4 id="help-scale-h">About the scale</h4>
+  <div class="g" id="help-scale"><b>Real scale</b> (default) places every orbit at its true distance in AU — so Amunet hugs the star and Horus sits far out at 46 AU; zoom out to find Shu and Horus. <b>Compressed</b> (toggle in the bottom bar) squeezes the huge 0.05–46 AU range so the whole system fits on screen at once. Body sizes are exaggerated in both modes (true sizes would be invisible). Real figures are in each world's data panel; orbital <b>speeds</b> follow Kepler's laws.</div>
   <h4 id="gloss-h">Glossary</h4>
   <div class="g" id="gloss"></div>
+  <h4 id="credits-h">Credits</h4>
+  <div class="g" id="credits">Solar System textures: planet &amp; Moon maps by <b>Solar System Scope</b> (solarsystemscope.com, CC BY 4.0); Galilean moons &amp; Titan from <b>NASA / JPL / USGS</b> imagery (public domain). Pluto, Charon &amp; Triton use their real imaged hemisphere (NASA New Horizons / Voyager 2) with a procedural fill over the never-imaged pole. Ra-system worlds use AI-generated maps. Built with Three.js.</div>
 </div>
 
 <div id="nav" class="panel scrollthin"></div>
 
 <div id="controls" class="panel">
   <button id="play" class="btn">⏸ Pause</button>
-  <div class="ctl"><label>Speed</label>
-    <input id="speed" type="range" min="0" max="100" value="54.84" style="width:120px">
-    <span id="speedval">5.3 hr/s</span>
+  <div class="ctl"><label id="lbl-speed">Speed</label>
+    <input id="speed" type="range" min="0" max="100" value="0" style="width:120px">
+    <span id="speedval">real-time</span>
   </div>
   <span id="elapsed" class="clock"></span>
   <div class="sep brk"></div>
-  <div class="ctl"><label>Size</label>
+  <div class="ctl"><label id="lbl-size">Size</label>
     <input id="size" type="range" min="40" max="260" value="100" style="width:90px">
     <button id="size-reset" class="btn" title="Reset size to default" style="padding:3px 7px">↺</button>
   </div>
@@ -242,6 +299,29 @@
   <button id="t-labels" class="btn on">🏷 Labels</button>
   <button id="t-tails" class="btn on" title="Toggle evaporation tails (Amunet, Sekhmet)">☄ Tails</button>
   <button id="reset" class="btn">⟲ Reset view</button>
+  <button id="t-fly" class="btn" title="Free-roam flight (real scale)">🚀 Fly</button>
+  <button id="t-impact" class="btn" title="Impact lab — customizable asteroid strikes &amp; laser">💥 Impact</button>
+  <button id="t-sfx" class="btn" title="Sound effects — not realistic (space is silent), but rule of cool">🔊 SFX</button>
+  <button id="t-system" class="btn" title="Switch between the fictional Ra system and our real Solar System">⇄ 🌍 Solar System</button>
+  <button id="t-lang" class="btn" title="Slovenčina / English">🌐 SK</button>
+</div>
+
+<div id="flyhud" class="panel">
+  <div class="flyrow"><b id="fly-title">🚀 Free-roam</b><button id="fly-model" class="btn sm">🎮 Flycam</button><button id="fly-auto" class="btn sm on" title="Speed auto-scales to nearby bodies — click for manual (uncapped) speed">⚡ Auto</button><button id="fly-exit" class="btn sm" title="Exit flight (Esc)">✕ Exit</button></div>
+  <div class="flyrow"><label id="lbl-throttle">Speed</label><input id="throttle" type="range" min="0" max="100" value="0"><span id="fly-speed">0 km/s</span></div>
+  <div class="flyrow"><button id="fly-fwd" class="btn sm" title="Thrust forward (hold)">▲</button><button id="fly-back" class="btn sm" title="Reverse (hold)">▼</button><button id="fly-goto" class="btn sm">⤳ Go&nbsp;to</button><button id="fly-follow" class="btn sm" title="Follow the target as it orbits (F)">⛓ Follow</button><button id="fly-orient" class="btn sm">◎ Orient</button><button id="fly-brake" class="btn sm">⏹ Brake</button></div>
+  <div class="flyrow tgt"><span id="fly-target">◎ no target — click a world</span><span id="fly-eta"></span></div>
+  <div class="flyrow hint" id="fly-hint">W/S or ↑↓ fly · A/D or ←→ strafe · PgUp/PgDn or R = up·down · drag = look · Q/E roll · wheel = speed · F = follow · click a world (again = go to) · Esc exit</div>
+</div>
+
+<div id="implab" class="panel">
+  <div class="improw"><b id="imp-title">💥 Impact lab</b><button id="imp-weapon" class="btn sm">☄ Asteroid</button><button id="imp-heal" class="btn sm" title="Remove every scar and reset all damage">🧽 Heal</button><button id="imp-exit" class="btn sm" title="Close (Esc)">✕</button></div>
+  <div class="improw imp-a"><label id="lbl-imp-dia">Diameter</label><input id="imp-dia" type="range" min="0" max="100" value="50"><span class="val" id="imp-dia-v">10 km</span></div>
+  <div class="improw imp-a"><label id="lbl-imp-spd">Speed</label><input id="imp-spd" type="range" min="0" max="100" value="12.7"><span class="val" id="imp-spd-v">30 km/s</span></div>
+  <div class="improw imp-a"><label id="lbl-imp-mat">Material</label><button id="imp-mat" class="btn sm">🪨 Rock</button><span class="val" style="margin-left:auto" id="imp-mass">—</span></div>
+  <div class="improw imp-l" style="display:none"><label id="lbl-imp-pow">Power</label><input id="imp-pow" type="range" min="0" max="100" value="33.3"><span class="val" id="imp-pow-v">1.0 EW</span></div>
+  <div class="improw"><span id="imp-energy">—</span></div>
+  <div class="improw hint" id="imp-hint">Click a world to strike it · scars persist · enough total energy shatters a crust</div>
 </div>
 
 <div id="info" class="panel">
@@ -264,7 +344,9 @@
 <script src="assets/lib/three.min.js"></script>
 <script src="assets/lib/OrbitControls.js"></script>
 <script src="assets/data.js"></script>
+<script src="assets/data-sol.js"></script>
 <script src="assets/descriptions-verbatim.js"></script>
+<script src="assets/lang-sk.js"></script>
 <script>window.USE_AI_TEXTURES=true;</script>
 <script src="assets/app.js"></script>
 </body>
