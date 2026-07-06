@@ -452,6 +452,50 @@ const flyKeys={};
 
 const labelLayer=document.getElementById('labels');
 
+// file:// + WebGL texture uploads are fragile in Chromium-family browsers. Local runs
+// load small per-texture data-url scripts asynchronously; HTTP(S) uses normal WebP URLs.
+const localTextureWait={};
+function bakedTextureKey(url){
+  const m=/(?:^|\/)([^\/]+)\.webp$/.exec(url);
+  return m&&m[1];
+}
+function loadTextureURL(url, onLoad, onProgress, onError, fileNoCors){
+  const loader=new THREE.TextureLoader();
+  if(fileNoCors) loader.setCrossOrigin(undefined);
+  return loader.load(url, onLoad, onProgress, onError);
+}
+function loadBakedTexture(url, onLoad, onProgress, onError){
+  if(typeof location!=='undefined' && location.protocol==='file:'){
+    const key=bakedTextureKey(url);
+    if(key){
+      window.RA_LOCAL_TEXTURES=window.RA_LOCAL_TEXTURES||{};
+      if(window.RA_LOCAL_TEXTURES[key]) return loadTextureURL(window.RA_LOCAL_TEXTURES[key], onLoad, onProgress, onError, false);
+      if(!localTextureWait[key]){
+        localTextureWait[key]=[];
+        const s=document.createElement('script');
+        s.async=true;
+        s.src='assets/img/textures/local-data/'+key+'.js';
+        s.onload=function(){
+          const q=localTextureWait[key]||[]; delete localTextureWait[key];
+          const data=window.RA_LOCAL_TEXTURES&&window.RA_LOCAL_TEXTURES[key];
+          q.forEach(fn=>fn(data));
+        };
+        s.onerror=function(){
+          const q=localTextureWait[key]||[]; delete localTextureWait[key];
+          q.forEach(fn=>fn(null));
+        };
+        document.head.appendChild(s);
+      }
+      localTextureWait[key].push(function(data){
+        loadTextureURL(data||url, onLoad, onProgress, onError, !data);
+      });
+      return null;
+    }
+    return loadTextureURL(url, onLoad, onProgress, onError, true);
+  }
+  return loadTextureURL(url, onLoad, onProgress, onError, false);
+}
+
 /* flat banded annulus in the planet's equator plane (Saturn). The band
    strip is a seeded 1D canvas (registered for Android canvas-wipe replay);
    UVs are remapped radially so the strip reads as concentric rings. */
@@ -496,7 +540,7 @@ function makeBodyRings(rec){
   // inner edge at u=0 — the radial UVs above sample it by radius). Falls back
   // to the procedural strip on any miss, just like the body maps.
   if(typeof window!=='undefined' && window.USE_AI_TEXTURES){
-    new THREE.TextureLoader().load('assets/img/textures/'+rec.data.key+'_rings.webp',
+    loadBakedTexture('assets/img/textures/'+rec.data.key+'_rings.webp',
       function(rt){ rt.anisotropy=4; m.material.map=rt; m.material.opacity=1; m.material.needsUpdate=true; t.dispose(); },
       undefined, function(){ /* keep procedural rings */ });
   }
@@ -564,7 +608,7 @@ function buildBodyMesh(data, radius){
   // The procedural map above shows instantly; if a baked image exists we swap it in,
   // and on any miss/error we silently keep the procedural texture.
   if(typeof window!=='undefined' && window.USE_AI_TEXTURES){
-    new THREE.TextureLoader().load(
+    loadBakedTexture(
       'assets/img/textures/'+data.key+'.webp',
       function(t){
         t.anisotropy=4; t.wrapS=map.wrapS; t.wrapT=map.wrapT;
@@ -1055,7 +1099,7 @@ let _impFlashTex=null, _impRingTex=null;
 let _impRockTex=null, _impRockReq=false, _astGlowTex=null;
 function impRockTex(){
   if(!_impRockReq){ _impRockReq=true;
-    new THREE.TextureLoader().load('assets/img/textures/debris.webp',
+    loadBakedTexture('assets/img/textures/debris.webp',
       function(t){ _impRockTex=t; if(_astMat){ _astMat.map=t; _astMat.color.setHex(0xffffff); _astMat.needsUpdate=true; } },
       undefined, function(){});
   }
