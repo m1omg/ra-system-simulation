@@ -59,6 +59,8 @@ ui: {
 },
 
 html: {
+  't-save':'💾 Uložiť',
+  't-load':'📂 Načítať',
   'loader-sub':'Budujem planetárnu sústavu…',
   'title-sub':'Interaktívna 3D simulácia',
   'title-h1':'Planetárna sústava <b>Ra</b>',
@@ -80,6 +82,10 @@ html: {
 },
 
 titles: {
+  't-save':'Uloží aktuálny stav sústavy (poškodenia, dráhy, zničené svety) v tomto prehliadači',
+  't-load':'Načíta naposledy uložený stav',
+  't-export':'Stiahne uložený stav ako súbor',
+  't-import':'Načíta stav zo súboru',
   't-scale':'Prepína skutočné vzdialenosti a stlačené dráhy',
   't-text':'Prepína autorov text a krátke zhrnutie',
   't-tails':'Zapne/vypne vyparovacie chvosty (Amunet, Sekhmet)',
